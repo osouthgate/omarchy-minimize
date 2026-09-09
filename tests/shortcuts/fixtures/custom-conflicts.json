@@ -1,0 +1,14 @@
+[
+  {
+    "modmask": 0,
+    "key": "mouse:276",
+    "keycode": 0,
+    "description": "Personal mouse action"
+  },
+  {
+    "modmask": 68,
+    "key": "K",
+    "keycode": 0,
+    "description": "Personal keyboard action"
+  }
+]

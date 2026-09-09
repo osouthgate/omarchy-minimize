@@ -1,0 +1,9 @@
+[
+  {
+    "modmask": 64,
+    "key": {
+      "unexpected": "object"
+    },
+    "description": "Malformed active binding"
+  }
+]

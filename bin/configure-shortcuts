@@ -1,0 +1,798 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly PLUGIN_ID="osouthgate.minimize"
+readonly BEGIN_MARKER="-- BEGIN ${PLUGIN_ID} shortcuts"
+readonly END_MARKER="-- END ${PLUGIN_ID} shortcuts"
+readonly DEFAULT_MINIMIZE_CHORD="SUPER + M"
+readonly DEFAULT_SIDEBAR_CHORD="SUPER + ALT + M"
+readonly MINIMIZE_DESCRIPTION="Minimize active window"
+readonly SIDEBAR_DESCRIPTION="Toggle minimized windows"
+readonly MINIMIZE_COMMAND="omarchy-shell ${PLUGIN_ID} minimize"
+readonly SIDEBAR_COMMAND="omarchy-shell shell toggle ${PLUGIN_ID}"
+
+usage() {
+  printf '%s\n' \
+    "Usage:" \
+    "  configure-shortcuts check --minimize-binding CHORD --sidebar-binding CHORD --json [OPTIONS]" \
+    "  configure-shortcuts apply --minimize-binding CHORD --sidebar-binding CHORD [OPTIONS]" \
+    "  configure-shortcuts add [--minimize-binding CHORD] [--sidebar-binding CHORD] [OPTIONS]" \
+    "  configure-shortcuts update [--minimize-binding CHORD] [--sidebar-binding CHORD] [OPTIONS]" \
+    "  configure-shortcuts remove [--config PATH] [--hyprctl PATH]" \
+    "  configure-shortcuts status [--json] [--config PATH]" \
+    "" \
+    "Defaults:" \
+    "  ${DEFAULT_MINIMIZE_CHORD}       ${MINIMIZE_DESCRIPTION}" \
+    "  ${DEFAULT_SIDEBAR_CHORD} ${SIDEBAR_DESCRIPTION}" \
+    "" \
+    "Custom examples:" \
+    "  configure-shortcuts add --minimize-binding 'mouse:275'" \
+    "  configure-shortcuts update --minimize-binding 'SUPER + MINUS'" \
+    "" \
+    "A chord has zero or more SUPER/CTRL/ALT/SHIFT modifiers and one key." \
+    "Mouse buttons use Hyprland's raw mouse:NUMBER form (272 through 767)." \
+    "check is read-only and reports canonical values plus every live conflict." \
+    "Existing bindings are never replaced. apply safely adds or updates only this plugin's owned block."
+}
+
+die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+canonicalize_chord() {
+  local raw="$1"
+  (( ${#raw} <= 128 )) || die "shortcut chord is too long"
+  [[ "$raw" != *$'\n'* && "$raw" != *$'\r'* && "$raw" != *$'\t'* ]] \
+    || die "shortcut chords must be single-line ASCII text"
+
+  local compact="${raw// /}"
+  [[ -n "$compact" && "$compact" != +* && "$compact" != *+ \
+      && "$compact" != *++* ]] || die "unsupported chord syntax: ${raw}"
+  [[ "$compact" =~ ^[A-Za-z0-9:_+-]+$ ]] || die "unsupported chord syntax: ${raw}"
+
+  local -a parts=()
+  local -a modifiers=()
+  local key=""
+  local part upper canonical_modifier
+  IFS='+' read -r -a parts <<<"$compact"
+  for part in "${parts[@]}"; do
+    upper="${part^^}"
+    canonical_modifier=""
+    case "$upper" in
+      SUPER|WIN|LOGO|MOD4|META) canonical_modifier="SUPER" ;;
+      CTRL|CONTROL) canonical_modifier="CTRL" ;;
+      ALT|MOD1) canonical_modifier="ALT" ;;
+      SHIFT) canonical_modifier="SHIFT" ;;
+    esac
+    if [[ -n "$canonical_modifier" ]]; then
+      modifiers+=("$canonical_modifier")
+    else
+      [[ -z "$key" ]] || die "a chord must contain exactly one non-modifier key"
+      key="$part"
+    fi
+  done
+  [[ -n "$key" ]] || die "a chord must contain a key in addition to any modifiers"
+
+  local -a ordered=()
+  local wanted found
+  for wanted in SUPER CTRL ALT SHIFT; do
+    found=0
+    for part in "${modifiers[@]}"; do
+      if [[ "$part" == "$wanted" ]]; then
+        (( found == 0 )) || die "duplicate modifier ${wanted}"
+        found=1
+      fi
+    done
+    (( found == 0 )) || ordered+=("$wanted")
+  done
+
+  if [[ "${key,,}" == mouse:* ]]; then
+    [[ "${key,,}" =~ ^mouse:([0-9]+)$ ]] \
+      || die "mouse buttons must use mouse:NUMBER"
+    local mouse_number="${BASH_REMATCH[1]}"
+    (( ${#mouse_number} <= 6 )) \
+      || die "mouse button numbers must be between 272 and 767"
+    local mouse_value=$((10#$mouse_number))
+    (( mouse_value >= 272 && mouse_value <= 767 )) \
+      || die "mouse button numbers must be between 272 and 767"
+    if (( mouse_value <= 274 && ${#ordered[@]} == 0 )); then
+      die "left, right, and middle mouse buttons require a modifier to avoid capturing normal clicks"
+    fi
+    key="mouse:${mouse_value}"
+  else
+    [[ "${key,,}" != mouse_* ]] \
+      || die "mouse wheel directions are not accepted for a minimize shortcut"
+    [[ "${key^^}" != CODE:* ]] \
+      || die "physical code:N bindings cannot be conflict-checked reliably; use the key name"
+    (( ${#key} <= 64 )) || die "shortcut key name is too long"
+    key="${key^^}"
+  fi
+
+  local result=""
+  for part in "${ordered[@]}"; do
+    [[ -z "$result" ]] || result+=" + "
+    result+="$part"
+  done
+  [[ -z "$result" ]] || result+=" + "
+  result+="$key"
+  printf '%s' "$result"
+}
+
+chord_mask() {
+  local compact="${1// /}"
+  local mask=0 part
+  local -a parts=()
+  IFS='+' read -r -a parts <<<"$compact"
+  for part in "${parts[@]}"; do
+    case "$part" in
+      SUPER) (( mask += 64 )) ;;
+      CTRL) (( mask += 4 )) ;;
+      ALT) (( mask += 8 )) ;;
+      SHIFT) (( mask += 1 )) ;;
+    esac
+  done
+  printf '%s' "$mask"
+}
+
+chord_key() {
+  printf '%s' "${1##* + }"
+}
+
+validate_distinct_chords() {
+  [[ "$1" != "$2" ]] || die "minimize and sidebar cannot use the same chord: $1"
+}
+
+validate_owned_block() {
+  local config="$1"
+  local begin_count end_count
+  begin_count="$(grep -Fxc -- "$BEGIN_MARKER" "$config" || true)"
+  end_count="$(grep -Fxc -- "$END_MARKER" "$config" || true)"
+  if [[ "$begin_count" == 0 && "$end_count" == 0 ]]; then
+    return 1
+  fi
+  [[ "$begin_count" == 1 && "$end_count" == 1 ]] \
+    || die "shortcut markers are incomplete or duplicated; inspect ${config} manually"
+  awk -v begin="$BEGIN_MARKER" -v end="$END_MARKER" '
+    $0 == begin { if (inside || seen_begin) exit 42; inside=1; seen_begin=1; next }
+    $0 == end { if (!inside || seen_end) exit 43; inside=0; seen_end=1; next }
+    END { if (inside || seen_begin != 1 || seen_end != 1) exit 44 }
+  ' "$config" >/dev/null \
+    || die "shortcut markers are out of order; inspect ${config} manually"
+  return 0
+}
+
+extract_owned_chord() {
+  local line="$1" description="$2" command="$3"
+  local prefix='o.bind("'
+  local suffix="\", \"${description}\", \"${command}\")"
+  [[ "$line" == "$prefix"*"$suffix" ]] \
+    || die "the owned shortcut block contains an unexpected binding; inspect it manually"
+  local chord="${line#"$prefix"}"
+  chord="${chord%"$suffix"}"
+  local canonical
+  canonical="$(canonicalize_chord "$chord")"
+  [[ "$canonical" == "$chord" ]] \
+    || die "the owned shortcut block contains a non-canonical chord; inspect it manually"
+  printf '%s' "$canonical"
+}
+
+current_minimize_chord=""
+current_sidebar_chord=""
+
+load_owned_chords() {
+  local config="$1"
+  validate_owned_block "$config" || return 1
+  local -a lines=()
+  mapfile -t lines < <(awk -v begin="$BEGIN_MARKER" -v end="$END_MARKER" '
+    $0 == begin { inside=1 }
+    inside { print }
+    $0 == end { exit }
+  ' "$config")
+  (( ${#lines[@]} == 4 )) \
+    || die "the owned shortcut block has an unexpected shape; inspect it manually"
+  [[ "${lines[0]}" == "$BEGIN_MARKER" && "${lines[3]}" == "$END_MARKER" ]] \
+    || die "the owned shortcut block has unexpected boundaries; inspect it manually"
+  current_minimize_chord="$(extract_owned_chord "${lines[1]}" \
+    "$MINIMIZE_DESCRIPTION" "$MINIMIZE_COMMAND")"
+  current_sidebar_chord="$(extract_owned_chord "${lines[2]}" \
+    "$SIDEBAR_DESCRIPTION" "$SIDEBAR_COMMAND")"
+  validate_distinct_chords "$current_minimize_chord" "$current_sidebar_chord"
+  return 0
+}
+
+print_owned_block() {
+  local minimize_chord="$1" sidebar_chord="$2"
+  printf '%s\n' "$BEGIN_MARKER"
+  printf 'o.bind("%s", "%s", "%s")\n' \
+    "$minimize_chord" "$MINIMIZE_DESCRIPTION" "$MINIMIZE_COMMAND"
+  printf 'o.bind("%s", "%s", "%s")\n' \
+    "$sidebar_chord" "$SIDEBAR_DESCRIPTION" "$SIDEBAR_COMMAND"
+  printf '%s\n' "$END_MARKER"
+}
+
+owned_block_matches() {
+  local config="$1" minimize_chord="$2" sidebar_chord="$3"
+  local actual expected
+  actual="$(mktemp)"
+  expected="$(mktemp)"
+  awk -v begin="$BEGIN_MARKER" -v end="$END_MARKER" '
+    $0 == begin { inside=1 }
+    inside { print }
+    $0 == end { exit }
+  ' "$config" >"$actual"
+  print_owned_block "$minimize_chord" "$sidebar_chord" >"$expected"
+  if cmp -s -- "$actual" "$expected"; then
+    rm -f -- "$actual" "$expected"
+    return 0
+  fi
+  rm -f -- "$actual" "$expected"
+  return 1
+}
+
+strip_owned_block() {
+  local source="$1" destination="$2"
+  sed '/^-- BEGIN osouthgate[.]minimize shortcuts$/,/^-- END osouthgate[.]minimize shortcuts$/d' \
+    "$source" >"$destination"
+}
+
+replace_owned_block() {
+  local source="$1" destination="$2" minimize_chord="$3" sidebar_chord="$4"
+  awk -v begin="$BEGIN_MARKER" '$0 == begin { exit } { print }' "$source" >"$destination"
+  print_owned_block "$minimize_chord" "$sidebar_chord" >>"$destination"
+  awk -v end="$END_MARKER" 'after { print } $0 == end { after=1 }' "$source" >>"$destination"
+}
+
+make_backup() {
+  local config="$1"
+  local stamp backup suffix
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  backup="${config}.bak.${stamp}"
+  suffix=0
+  while [[ -e "$backup" ]]; do
+    (( suffix += 1 ))
+    backup="${config}.bak.${stamp}.${suffix}"
+  done
+  cp --preserve=mode,timestamps -- "$config" "$backup"
+  printf '%s' "$backup"
+}
+
+replace_atomically() {
+  local source="$1" destination="$2"
+  chmod --reference="$destination" "$source"
+  mv -f -- "$source" "$destination"
+}
+
+restore_backup() {
+  local backup="$1" config="$2"
+  local restore_temp
+  restore_temp="$(mktemp "$(dirname -- "$config")/.omarchy-minimize-rollback.XXXXXX")" \
+    || return 1
+  if ! cp --preserve=mode,timestamps -- "$backup" "$restore_temp"; then
+    rm -f -- "$restore_temp"
+    return 1
+  fi
+  if ! replace_atomically "$restore_temp" "$config"; then
+    rm -f -- "$restore_temp"
+    return 1
+  fi
+  "$hyprctl_command" reload >/dev/null 2>&1 || true
+  return 0
+}
+
+reload_and_validate() {
+  local errors
+  "$hyprctl_command" reload >/dev/null || return 1
+  errors="$("$hyprctl_command" configerrors 2>&1)" || return 1
+  if [[ -n "$(trim "$errors")" ]]; then
+    printf '%s\n' "$errors" >&2
+    return 1
+  fi
+}
+
+load_bindings_snapshot() {
+  local fixture="$1"
+  command -v jq >/dev/null 2>&1 || die "jq is unavailable; no configuration was changed"
+  if [[ -n "$fixture" ]]; then
+    [[ -r "$fixture" ]] || die "bindings fixture is unreadable: ${fixture}"
+    bindings_snapshot="$fixture"
+    owns_bindings_snapshot=0
+  else
+    bindings_snapshot="$(mktemp)"
+    owns_bindings_snapshot=1
+    if ! "$hyprctl_command" binds -j >"$bindings_snapshot"; then
+      rm -f -- "$bindings_snapshot"
+      bindings_snapshot=""
+      die "could not inspect active Hyprland bindings; no configuration was changed"
+    fi
+  fi
+  if ! jq -e 'type == "array"' "$bindings_snapshot" >/dev/null; then
+    (( owns_bindings_snapshot == 0 )) || rm -f -- "$bindings_snapshot"
+    bindings_snapshot=""
+    die "Hyprland binding data is not a JSON array; no configuration was changed"
+  fi
+}
+
+find_conflicts_for_chord() {
+  local json_file="$1" chord="$2" allow_owned="$3"
+  local mask key current_minimize_mask current_minimize_key current_sidebar_mask current_sidebar_key
+  mask="$(chord_mask "$chord")"
+  key="$(chord_key "$chord")"
+  current_minimize_mask="$(chord_mask "${current_minimize_chord:-M}")"
+  current_minimize_key="$(chord_key "${current_minimize_chord:-M}")"
+  current_sidebar_mask="$(chord_mask "${current_sidebar_chord:-M}")"
+  current_sidebar_key="$(chord_key "${current_sidebar_chord:-M}")"
+
+  local rows
+  if ! rows="$(jq -r \
+      --argjson wanted_mask "$mask" --arg wanted_key "$key" \
+      --argjson minimize_mask "$current_minimize_mask" --arg minimize_key "$current_minimize_key" \
+      --argjson sidebar_mask "$current_sidebar_mask" --arg sidebar_key "$current_sidebar_key" \
+      --arg minimize_description "$MINIMIZE_DESCRIPTION" \
+      --arg sidebar_description "$SIDEBAR_DESCRIPTION" '
+        def binding_name:
+          if ((.description // "") | length) > 0 then .description
+          elif ((.dispatcher // "") | length) > 0 then .dispatcher
+          else "unnamed existing binding"
+          end;
+        .[]
+        | ((.modmask // -1) | tonumber? // -1) as $mask
+        | ((.key // "") | ascii_upcase) as $key
+        | select($mask == $wanted_mask and $key == ($wanted_key | ascii_upcase))
+        | if ($mask == $minimize_mask and $key == ($minimize_key | ascii_upcase)
+              and (.description // "") == $minimize_description) then
+            ["own-minimize", binding_name]
+          elif ($mask == $sidebar_mask and $key == ($sidebar_key | ascii_upcase)
+              and (.description // "") == $sidebar_description) then
+            ["own-sidebar", binding_name]
+          else ["other", binding_name]
+          end
+        | @tsv
+      ' "$json_file")"; then
+    return 1
+  fi
+
+  local skipped_minimize=0 skipped_sidebar=0 tag name
+  while IFS=$'\t' read -r tag name; do
+    [[ -n "$tag" ]] || continue
+    case "$tag" in
+      own-minimize)
+        if [[ "$allow_owned" == 1 && "$skipped_minimize" == 0 ]]; then
+          skipped_minimize=1
+          continue
+        fi
+        ;;
+      own-sidebar)
+        if [[ "$allow_owned" == 1 && "$skipped_sidebar" == 0 ]]; then
+          skipped_sidebar=1
+          continue
+        fi
+        ;;
+    esac
+    printf '%s\t%s\n' "$chord" "$name"
+  done <<<"$rows"
+}
+
+find_conflicts() {
+  local json_file="$1" minimize_chord="$2" sidebar_chord="$3" allow_owned="$4"
+  find_conflicts_for_chord "$json_file" "$minimize_chord" "$allow_owned" || return 1
+  find_conflicts_for_chord "$json_file" "$sidebar_chord" "$allow_owned" || return 1
+}
+
+print_status_json() {
+  local configured="$1" minimize_chord="${2:-}" sidebar_chord="${3:-}"
+  command -v jq >/dev/null 2>&1 || die "jq is unavailable; shortcut status could not be encoded"
+  jq -nc --argjson configured "$configured" \
+    --arg minimize "$minimize_chord" --arg sidebar "$sidebar_chord" \
+    '{ok:true, configured:$configured, minimizeBinding:$minimize, sidebarBinding:$sidebar}'
+}
+
+conflict_names_json() {
+  local rows="$1"
+  printf '%s\n' "$rows" | awk -F '\t' 'NF >= 2 { print substr($0, index($0, $2)) }' \
+    | jq -Rsc 'split("\n") | map(select(length > 0))'
+}
+
+check_field_json() {
+  local input="$1" canonical="$2" valid="$3" conflicts="$4" message="$5"
+  local conflicts_json available=false
+  conflicts_json="$(conflict_names_json "$conflicts")"
+  if [[ "$valid" == true ]] && [[ "$conflicts_json" == '[]' ]]; then
+    available=true
+  fi
+  jq -nc \
+    --arg input "$input" \
+    --arg binding "$canonical" \
+    --argjson valid "$valid" \
+    --argjson available "$available" \
+    --argjson conflicts "$conflicts_json" \
+    --arg message "$message" \
+    '{input:$input, binding:$binding, valid:$valid, available:$available,
+      conflicts:$conflicts, message:$message}'
+}
+
+print_check_json() {
+  local minimize_json="$1" sidebar_json="$2" duplicate="$3"
+  jq -nc \
+    --argjson minimize "$minimize_json" \
+    --argjson sidebar "$sidebar_json" \
+    --argjson duplicate "$duplicate" \
+    '{ok:true, minimize:$minimize, sidebar:$sidebar, duplicate:$duplicate,
+      pairAvailable:($minimize.available and $sidebar.available and ($duplicate | not))}'
+}
+
+lock_fd=""
+acquire_mutation_lock() {
+  command -v flock >/dev/null 2>&1 \
+    || die "flock is unavailable; no configuration was changed"
+  local lock_root lock_path
+  lock_root="${XDG_RUNTIME_DIR:-$(dirname -- "$config_path")}"
+  [[ -d "$lock_root" ]] || die "shortcut lock directory is unavailable; no configuration was changed"
+  lock_path="${OMARCHY_MINIMIZE_SHORTCUT_LOCK:-${lock_root}/omarchy-minimize-shortcuts.lock}"
+  [[ ! -L "$lock_path" ]] || die "shortcut lock path is a symlink; no configuration was changed"
+  exec {lock_fd}>"$lock_path" \
+    || die "shortcut lock could not be opened; no configuration was changed"
+  flock -n "$lock_fd" \
+    || die "another Omarchy Minimize shortcut change is already running; no configuration was changed"
+}
+
+temp_file=""
+bindings_snapshot=""
+owns_bindings_snapshot=0
+transaction_active=0
+transaction_backup=""
+transaction_config=""
+
+cleanup_on_exit() {
+  local exit_code=$?
+  trap - EXIT HUP INT TERM
+  if (( transaction_active == 1 )); then
+    if restore_backup "$transaction_backup" "$transaction_config"; then
+      printf 'Error: interrupted shortcut mutation; restored %s byte-for-byte\n' \
+        "$transaction_backup" >&2
+    else
+      printf 'Error: automatic rollback failed; restore %s to %s manually\n' \
+        "$transaction_backup" "$transaction_config" >&2
+    fi
+  fi
+  [[ -z "$temp_file" ]] || rm -f -- "$temp_file"
+  if (( owns_bindings_snapshot == 1 )) && [[ -n "$bindings_snapshot" ]]; then
+    rm -f -- "$bindings_snapshot"
+  fi
+  exit "$exit_code"
+}
+
+trap cleanup_on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+action="${1:-}"
+[[ -n "$action" ]] || { usage; exit 2; }
+shift
+
+config_path="${XDG_CONFIG_HOME:-${HOME}/.config}/hypr/bindings.lua"
+bindings_json=""
+hyprctl_command="hyprctl"
+requested_minimize=""
+requested_sidebar=""
+minimize_provided=0
+sidebar_provided=0
+json_output=0
+
+while (( $# > 0 )); do
+  case "$1" in
+    --minimize-binding|--minimize)
+      (( $# >= 2 )) || die "$1 requires a chord"
+      requested_minimize="$2"
+      minimize_provided=1
+      shift 2
+      ;;
+    --sidebar-binding|--sidebar)
+      (( $# >= 2 )) || die "$1 requires a chord"
+      requested_sidebar="$2"
+      sidebar_provided=1
+      shift 2
+      ;;
+    --config)
+      (( $# >= 2 )) || die "--config requires a path"
+      config_path="$2"
+      shift 2
+      ;;
+    --bindings-json)
+      (( $# >= 2 )) || die "--bindings-json requires a path"
+      bindings_json="$2"
+      shift 2
+      ;;
+    --hyprctl)
+      (( $# >= 2 )) || die "--hyprctl requires a path"
+      hyprctl_command="$2"
+      shift 2
+      ;;
+    --json)
+      json_output=1
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --*)
+      die "unknown option: $1"
+      ;;
+    *)
+      die "unexpected argument: $1"
+      ;;
+  esac
+done
+
+[[ "$action" == "check" || "$action" == "apply" || "$action" == "add" || "$action" == "update" \
+    || "$action" == "remove" || "$action" == "status" ]] || { usage; exit 2; }
+if [[ "$action" != "check" && "$action" != "apply" && "$action" != "add" && "$action" != "update" ]]; then
+  (( minimize_provided == 0 && sidebar_provided == 0 )) \
+    || die "custom binding options are valid only with apply, add, or update"
+fi
+if [[ "$action" != "check" && "$action" != "apply" && "$action" != "add" && "$action" != "update" && -n "$bindings_json" ]]; then
+  die "--bindings-json is valid only with check, apply, add, or update"
+fi
+(( json_output == 0 )) || [[ "$action" == "status" || "$action" == "check" ]] \
+  || die "--json is valid only with status or check"
+if [[ "$action" == "apply" ]]; then
+  (( minimize_provided == 1 && sidebar_provided == 1 )) \
+    || die "apply requires both --minimize-binding and --sidebar-binding"
+fi
+
+if [[ -L "$config_path" ]]; then
+  resolved_config="$(readlink -f -- "$config_path")" \
+    || die "could not resolve binding-file symlink: ${config_path}"
+  [[ -f "$resolved_config" ]] \
+    || die "binding-file symlink does not resolve to a regular file: ${config_path}"
+  config_path="$resolved_config"
+fi
+[[ -f "$config_path" ]] || die "Omarchy binding file not found: ${config_path}"
+
+if [[ "$action" != "status" ]]; then
+  case "$hyprctl_command" in
+    */*) [[ -x "$hyprctl_command" ]] || die "hyprctl command is not executable: ${hyprctl_command}" ;;
+    *) command -v "$hyprctl_command" >/dev/null 2>&1 \
+         || die "hyprctl command is unavailable: ${hyprctl_command}" ;;
+  esac
+  [[ "$action" == "check" ]] || acquire_mutation_lock
+fi
+
+if [[ "$action" == "apply" ]]; then
+  if load_owned_chords "$config_path"; then
+    action="update"
+  else
+    action="add"
+  fi
+fi
+
+case "$action" in
+  status)
+    if ! load_owned_chords "$config_path"; then
+      if (( json_output == 1 )); then
+        print_status_json false
+        exit 0
+      fi
+      printf 'Omarchy Minimize shortcuts are not configured in %s\n' "$config_path"
+      exit 1
+    fi
+    if (( json_output == 1 )); then
+      print_status_json true "$current_minimize_chord" "$current_sidebar_chord"
+      exit 0
+    fi
+    printf 'Configured in %s:\n' "$config_path"
+    printf '  %s -> %s\n' "$current_minimize_chord" "$MINIMIZE_COMMAND"
+    printf '  %s -> %s\n' "$current_sidebar_chord" "$SIDEBAR_COMMAND"
+    ;;
+
+  check)
+    (( json_output == 1 )) || die "check requires --json"
+    command -v jq >/dev/null 2>&1 || die "jq is unavailable; shortcut availability could not be encoded"
+
+    owned_present=0
+    if load_owned_chords "$config_path"; then
+      owned_present=1
+    fi
+
+    minimize_chord=""
+    sidebar_chord=""
+    minimize_valid=false
+    sidebar_valid=false
+    minimize_message="Record or enter a shortcut."
+    sidebar_message="Record or enter a shortcut."
+
+    if (( minimize_provided == 1 )) && [[ -n "$(trim "$requested_minimize")" ]]; then
+      if minimize_chord="$(canonicalize_chord "$requested_minimize" 2>&1)"; then
+        minimize_valid=true
+        minimize_message=""
+      else
+        minimize_message="${minimize_chord#Error: }"
+        minimize_chord=""
+      fi
+    fi
+    if (( sidebar_provided == 1 )) && [[ -n "$(trim "$requested_sidebar")" ]]; then
+      if sidebar_chord="$(canonicalize_chord "$requested_sidebar" 2>&1)"; then
+        sidebar_valid=true
+        sidebar_message=""
+      else
+        sidebar_message="${sidebar_chord#Error: }"
+        sidebar_chord=""
+      fi
+    fi
+
+    minimize_conflicts=""
+    sidebar_conflicts=""
+    if [[ "$minimize_valid" == true || "$sidebar_valid" == true ]]; then
+      load_bindings_snapshot "$bindings_json"
+      if [[ "$minimize_valid" == true ]]; then
+        minimize_conflicts="$(find_conflicts_for_chord "$bindings_snapshot" \
+          "$minimize_chord" "$owned_present")" \
+          || die "could not interpret active Hyprland bindings; no configuration was changed"
+      fi
+      if [[ "$sidebar_valid" == true ]]; then
+        sidebar_conflicts="$(find_conflicts_for_chord "$bindings_snapshot" \
+          "$sidebar_chord" "$owned_present")" \
+          || die "could not interpret active Hyprland bindings; no configuration was changed"
+      fi
+      (( owns_bindings_snapshot == 0 )) || rm -f -- "$bindings_snapshot"
+      owns_bindings_snapshot=0
+      bindings_snapshot=""
+    fi
+
+    duplicate=false
+    if [[ "$minimize_valid" == true && "$sidebar_valid" == true \
+        && "$minimize_chord" == "$sidebar_chord" ]]; then
+      duplicate=true
+      minimize_message="This is also assigned to Open minimize sidebar."
+      sidebar_message="This is also assigned to Minimize focused window."
+    fi
+
+    minimize_json="$(check_field_json "$requested_minimize" "$minimize_chord" \
+      "$minimize_valid" "$minimize_conflicts" "$minimize_message")"
+    sidebar_json="$(check_field_json "$requested_sidebar" "$sidebar_chord" \
+      "$sidebar_valid" "$sidebar_conflicts" "$sidebar_message")"
+    if [[ "$duplicate" == true ]]; then
+      minimize_json="$(jq -c '.available = false' <<<"$minimize_json")"
+      sidebar_json="$(jq -c '.available = false' <<<"$sidebar_json")"
+    fi
+    print_check_json "$minimize_json" "$sidebar_json" "$duplicate"
+    ;;
+
+  add)
+    minimize_chord="$(canonicalize_chord "${requested_minimize:-$DEFAULT_MINIMIZE_CHORD}")"
+    sidebar_chord="$(canonicalize_chord "${requested_sidebar:-$DEFAULT_SIDEBAR_CHORD}")"
+    validate_distinct_chords "$minimize_chord" "$sidebar_chord"
+    if load_owned_chords "$config_path"; then
+      if owned_block_matches "$config_path" "$minimize_chord" "$sidebar_chord"; then
+        printf 'Omarchy Minimize shortcuts are already configured in %s\n' "$config_path"
+        exit 0
+      fi
+      die "different Omarchy Minimize shortcuts are already configured; use update"
+    fi
+
+    load_bindings_snapshot "$bindings_json"
+    if ! conflicts="$(find_conflicts "$bindings_snapshot" \
+        "$minimize_chord" "$sidebar_chord" 0)"; then
+      die "could not interpret active Hyprland bindings; no configuration was changed"
+    fi
+    (( owns_bindings_snapshot == 0 )) || rm -f -- "$bindings_snapshot"
+    owns_bindings_snapshot=0
+    bindings_snapshot=""
+    if [[ -n "$conflicts" ]]; then
+      printf 'Error: every requested Omarchy Minimize shortcut must be free; no configuration was changed.\n' >&2
+      while IFS=$'\t' read -r chord name; do
+        printf '  Conflict: %s is already bound to %s\n' "$chord" "$name" >&2
+      done <<<"$conflicts"
+      exit 1
+    fi
+
+    temp_file="$(mktemp "$(dirname -- "$config_path")/.omarchy-minimize-bindings.XXXXXX")"
+    cp -- "$config_path" "$temp_file"
+    if [[ -s "$temp_file" ]]; then
+      last_byte="$(tail -c 1 -- "$temp_file" | od -An -tuC | tr -d '[:space:]')"
+      [[ "$last_byte" == "10" ]] \
+        || die "${config_path} must end with a newline; no configuration was changed"
+    fi
+    print_owned_block "$minimize_chord" "$sidebar_chord" >>"$temp_file"
+
+    backup="$(make_backup "$config_path")"
+    transaction_backup="$backup"
+    transaction_config="$config_path"
+    transaction_active=1
+    replace_atomically "$temp_file" "$config_path"
+    temp_file=""
+    if ! reload_and_validate; then
+      if restore_backup "$backup" "$config_path"; then
+        transaction_active=0
+        die "Hyprland rejected the shortcut change; restored ${backup} byte-for-byte"
+      fi
+      die "Hyprland rejected the shortcut change and automatic rollback failed; restore ${backup} manually"
+    fi
+    transaction_active=0
+    printf 'Configured minimize=%s and sidebar=%s. Backup: %s\n' \
+      "$minimize_chord" "$sidebar_chord" "$backup"
+    ;;
+
+  update)
+    (( minimize_provided == 1 || sidebar_provided == 1 )) \
+      || die "update requires --minimize-binding, --sidebar-binding, or both"
+    load_owned_chords "$config_path" || die "Omarchy Minimize shortcuts are not configured; use add"
+    minimize_chord="$current_minimize_chord"
+    sidebar_chord="$current_sidebar_chord"
+    (( minimize_provided == 0 )) || minimize_chord="$(canonicalize_chord "$requested_minimize")"
+    (( sidebar_provided == 0 )) || sidebar_chord="$(canonicalize_chord "$requested_sidebar")"
+    validate_distinct_chords "$minimize_chord" "$sidebar_chord"
+    if owned_block_matches "$config_path" "$minimize_chord" "$sidebar_chord"; then
+      printf 'Omarchy Minimize shortcuts already match the requested configuration in %s\n' "$config_path"
+      exit 0
+    fi
+
+    load_bindings_snapshot "$bindings_json"
+    if ! conflicts="$(find_conflicts "$bindings_snapshot" \
+        "$minimize_chord" "$sidebar_chord" 1)"; then
+      die "could not interpret active Hyprland bindings; no configuration was changed"
+    fi
+    (( owns_bindings_snapshot == 0 )) || rm -f -- "$bindings_snapshot"
+    owns_bindings_snapshot=0
+    bindings_snapshot=""
+    if [[ -n "$conflicts" ]]; then
+      printf 'Error: every requested Omarchy Minimize shortcut must be free; no configuration was changed.\n' >&2
+      while IFS=$'\t' read -r chord name; do
+        printf '  Conflict: %s is already bound to %s\n' "$chord" "$name" >&2
+      done <<<"$conflicts"
+      exit 1
+    fi
+
+    temp_file="$(mktemp "$(dirname -- "$config_path")/.omarchy-minimize-bindings.XXXXXX")"
+    replace_owned_block "$config_path" "$temp_file" "$minimize_chord" "$sidebar_chord"
+    backup="$(make_backup "$config_path")"
+    transaction_backup="$backup"
+    transaction_config="$config_path"
+    transaction_active=1
+    replace_atomically "$temp_file" "$config_path"
+    temp_file=""
+    if ! reload_and_validate; then
+      if restore_backup "$backup" "$config_path"; then
+        transaction_active=0
+        die "Hyprland rejected the shortcut update; restored ${backup} byte-for-byte"
+      fi
+      die "Hyprland rejected the shortcut update and automatic rollback failed; restore ${backup} manually"
+    fi
+    transaction_active=0
+    printf 'Updated minimize=%s and sidebar=%s. Backup: %s\n' \
+      "$minimize_chord" "$sidebar_chord" "$backup"
+    ;;
+
+  remove)
+    if ! validate_owned_block "$config_path"; then
+      printf 'Omarchy Minimize shortcuts are already absent from %s\n' "$config_path"
+      exit 0
+    fi
+    temp_file="$(mktemp "$(dirname -- "$config_path")/.omarchy-minimize-bindings.XXXXXX")"
+    strip_owned_block "$config_path" "$temp_file"
+    backup="$(make_backup "$config_path")"
+    transaction_backup="$backup"
+    transaction_config="$config_path"
+    transaction_active=1
+    replace_atomically "$temp_file" "$config_path"
+    temp_file=""
+    if ! reload_and_validate; then
+      if restore_backup "$backup" "$config_path"; then
+        transaction_active=0
+        die "Hyprland rejected shortcut removal; restored ${backup} byte-for-byte"
+      fi
+      die "Hyprland rejected shortcut removal and automatic rollback failed; restore ${backup} manually"
+    fi
+    transaction_active=0
+    printf 'Removed only the %s shortcut block. Backup: %s\n' "$PLUGIN_ID" "$backup"
+    ;;
+esac

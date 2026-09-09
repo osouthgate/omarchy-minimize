@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+readonly OUTCOME="${REPO_DIR}/docs/outcomes/omarchy-minimize.md"
+readonly REQUESTED="${1:-AT-ALL}"
+readonly EXPECTED_IDS="AT-1 AT-2 AT-3 AT-4 AT-5 AT-6 AT-7 AT-8 AT-9"
+
+if (( $# > 1 )); then
+  printf 'Usage: %s [AT-ALL|AT-1..AT-9]\n' "$0" >&2
+  exit 2
+fi
+
+work_dir="$(mktemp -d)"
+trap 'rm -rf -- "$work_dir"' EXIT
+shortcut_checked=0
+live_checked=0
+
+fail() {
+  printf 'not ok - %s\n' "$*" >&2
+  exit 1
+}
+
+require_file() {
+  [[ -f "$1" ]] || fail "missing required file: $1"
+}
+
+require_text() {
+  local file="$1"
+  local text="$2"
+  rg -Fq -- "$text" "$file" || fail "${file} does not contain: ${text}"
+}
+
+require_pattern() {
+  local file="$1"
+  local pattern="$2"
+  rg -q -- "$pattern" "$file" || fail "${file} does not match: ${pattern}"
+}
+
+extract_bash_after_heading() {
+  local heading="$1"
+  local destination="$2"
+  awk -v heading="$heading" '
+    $0 == heading { in_section=1; next }
+    in_section && /^#{2,3} / { exit }
+    in_section && $0 == "```bash" { in_code=1; next }
+    in_code && $0 == "```" { found=1; exit }
+    in_code { print }
+    END { if (!found) exit 65 }
+  ' "${REPO_DIR}/README.md" >"$destination" \
+    || fail "could not extract the README command block after: ${heading}"
+  bash -n "$destination" || fail "README command block has invalid Bash syntax: ${heading}"
+}
+
+ensure_shortcuts() {
+  if (( shortcut_checked == 0 )); then
+    if ! bash "${REPO_DIR}/tests/shortcuts/configure-shortcuts.test.sh" \
+        >"${work_dir}/shortcuts.out" 2>&1; then
+      sed 's/^/shortcut: /' "${work_dir}/shortcuts.out" >&2
+      fail 'shortcut acceptance dependency failed'
+    fi
+    shortcut_checked=1
+  fi
+}
+
+ensure_live() {
+  if (( live_checked == 0 )); then
+    if ! OMARCHY_MINIMIZE_LIVE=1 bash "${REPO_DIR}/scripts/live-smoke" \
+        >"${work_dir}/live.out" 2>&1; then
+      sed 's/^/live: /' "${work_dir}/live.out" >&2
+      fail 'live acceptance dependency failed'
+    fi
+    live_checked=1
+  fi
+}
+
+at_1() {
+  ensure_shortcuts
+  require_text "${work_dir}/shortcuts.out" "SHORTCUT_CONFLICT"
+  require_text "${work_dir}/shortcuts.out" "SHORTCUT_CHECK free=yes conflict=named duplicate=blocked invalid=explained mutation=no"
+  require_text "${work_dir}/shortcuts.out" "SHORTCUT_CUSTOM"
+  require_text "${work_dir}/shortcuts.out" "SUPER + M"
+  require_text "${work_dir}/shortcuts.out" "mouse=yes"
+  require_text "${work_dir}/shortcuts.out" "unchanged"
+  require_text "${work_dir}/shortcuts.out" "SHORTCUT_JSON absent=exit-0 configured=exit-0 malformed=exit-1 mutation=no"
+  require_text "${work_dir}/shortcuts.out" "SHORTCUT_APPLY add=yes update=yes idempotent=yes lock-contention=unchanged"
+  printf '%s\n' 'ok - AT-1 read-only JSON and conflict-safe default/custom shortcut apply'
+}
+
+at_2() {
+  ensure_shortcuts
+  require_text "${work_dir}/shortcuts.out" "SHORTCUT_ADD"
+  require_text "${work_dir}/shortcuts.out" "SHORTCUT_ROLLBACK"
+  require_text "${work_dir}/shortcuts.out" "SHORTCUT_REMOVE"
+  require_text "${work_dir}/shortcuts.out" "SHORTCUT_UPDATE"
+  require_text "${work_dir}/shortcuts.out" "self-exclusion=yes"
+  require_text "${work_dir}/shortcuts.out" "byte-identical"
+  require_text "${work_dir}/shortcuts.out" "lock-contention=unchanged"
+  printf '%s\n' 'ok - AT-2 marked-block update, validation, rollback, and removal'
+}
+
+at_3() {
+  require_file "${REPO_DIR}/README.md"
+  require_file "${REPO_DIR}/AGENTS.md"
+  require_file "${REPO_DIR}/HelpView.qml"
+  require_file "${REPO_DIR}/ShortcutSettingsView.qml"
+  for heading in "## Install" "## Daily use" "## Settings" "## Interoperability" \
+      "## Recovery" "## Remove" "## Development" "## Limitations"; do
+    require_text "${REPO_DIR}/README.md" "$heading"
+  done
+  for text in 'Super+Alt+S' 'Super+S' 'right-click' 'middle-click' 'Shift+Enter' \
+      'mouse:275' '--minimize-binding' '--sidebar-binding' 'OmaVeil' 'NiflVeil' \
+      'Dock' 'scratchpad' 'Needs attention' 'Updated' 'Configure shortcuts' \
+      'Reset suggestions' 'Remove owned shortcuts' 'F1 / ?' 'restoreHere' \
+      'remembered workspace' 'Opening the page and choosing' 'mouse:767'; do
+    require_text "${REPO_DIR}/README.md" "$text"
+  done
+  require_text "${REPO_DIR}/HelpView.qml" 'Neither marker means a job completed or succeeded.'
+  require_text "${REPO_DIR}/HelpView.qml" 'Pinned and grouped windows are intentionally unsupported'
+  require_text "${REPO_DIR}/ShortcutSettingsView.qml" 'Already used by:'
+  require_text "${REPO_DIR}/ShortcutSettingsView.qml" 'Record captures ordinary keys'
+  require_text "${REPO_DIR}/ShortcutSettingsView.qml" 'Choose Remove owned shortcuts again to confirm.'
+  require_text "${REPO_DIR}/README.md" 'The sidebar closes after success.'
+  require_text "${REPO_DIR}/HelpView.qml" 'stays open if restoration fails'
+  require_text "${REPO_DIR}/manifest.json" '"version": "0.4.1"'
+  require_text "${REPO_DIR}/package.json" '"version": "0.4.1"'
+  for executable in bin/configure-shortcuts tests/qml-service-smoke.sh tests/qml-smoke.sh \
+      tests/shortcuts/configure-shortcuts.test.sh tests/acceptance/run scripts/live-smoke; do
+    [[ -f "${REPO_DIR}/${executable}" ]] \
+      || fail "documented command path is missing: ${executable}"
+    require_text "${REPO_DIR}/README.md" "$executable"
+  done
+  [[ -x "${REPO_DIR}/bin/configure-shortcuts" ]] \
+    || fail 'directly invoked shortcut helper is not executable'
+  if rg -Fq 'tests/shortcuts/run' "${REPO_DIR}/README.md"; then
+    fail 'README references the obsolete shortcut test path'
+  fi
+  printf '%s\n' 'ok - AT-3 complete install, controls, interop, settings, and limitation guide'
+}
+
+at_4() {
+  for text in 'special:minimum' 'special:minimized' 'special:scratchpad' \
+      'hyprctl repl' 'focus_on_activate' 'value="unset"'; do
+    require_text "${REPO_DIR}/README.md" "$text"
+  done
+  require_text "${REPO_DIR}/README.md" 'without Omarchy Minimize running'
+
+  local rescue_script rescue_bin rescue_state rescue_log
+  rescue_script="${work_dir}/readme-rescue.sh"
+  rescue_bin="${work_dir}/rescue-bin"
+  rescue_state="${work_dir}/rescue-state"
+  rescue_log="${work_dir}/rescue.log"
+  extract_bash_after_heading '### Restore every accepted alias to the active workspace' "$rescue_script"
+  mkdir -p "$rescue_bin"
+  ln -s "${REPO_DIR}/tests/acceptance/fake-hyprctl" "${rescue_bin}/hyprctl"
+  : >"$rescue_state"
+  PATH="${rescue_bin}:$PATH" \
+    OMARCHY_MINIMIZE_FAKE_CLIENTS="${REPO_DIR}/tests/acceptance/fixtures/rescue-clients.json" \
+    OMARCHY_MINIMIZE_FAKE_STATE="$rescue_state" \
+    OMARCHY_MINIMIZE_FAKE_LOG="$rescue_log" \
+    bash "$rescue_script" >"${work_dir}/readme-rescue.out"
+  [[ "$(rg -c '^repl ' "$rescue_log" || true)" == 3 ]] \
+    || fail 'README rescue did not issue exactly three identity-scoped repl requests'
+  for address in 0xa11ce1 0xa11ce2 0xa11ce3; do
+    require_text "$rescue_log" "repl ${address}"
+  done
+  require_text "${work_dir}/readme-rescue.out" 'Restored and verified 3 window(s).'
+
+  ensure_live
+  require_text "${work_dir}/live.out" 'rescue-aliases=minimum,minimized,scratchpad'
+  require_text "${work_dir}/live.out" 'rescue-unset=pass'
+  printf '%s\n' 'ok - AT-4 plugin-independent three-alias compositor rescue'
+}
+
+at_5() {
+  require_text "${REPO_DIR}/README.md" 'restoreAll'
+  require_text "${REPO_DIR}/README.md" 'owned'
+  require_text "${REPO_DIR}/README.md" 'externally owned'
+  require_text "${REPO_DIR}/README.md" 'prepareRemoval'
+  require_text "${REPO_DIR}/README.md" 'cancelRemoval'
+  require_text "${REPO_DIR}/README.md" 'omarchy plugin remove osouthgate.minimize'
+
+  local remove_script remove_bin remove_state remove_log fake_config_home helper_path
+  remove_script="${work_dir}/readme-remove.sh"
+  remove_bin="${work_dir}/remove-bin"
+  remove_state="${work_dir}/remove-state"
+  remove_log="${work_dir}/remove.log"
+  fake_config_home="${work_dir}/config"
+  helper_path="${fake_config_home}/omarchy/plugins/osouthgate.minimize/bin/configure-shortcuts"
+  extract_bash_after_heading '## Remove' "$remove_script"
+  mkdir -p "$remove_bin" "$(dirname -- "$helper_path")"
+  ln -s "${REPO_DIR}/tests/acceptance/fake-omarchy-shell" "${remove_bin}/omarchy-shell"
+  ln -s "${REPO_DIR}/tests/acceptance/fake-omarchy" "${remove_bin}/omarchy"
+  ln -s "$(command -v true)" "${remove_bin}/sleep"
+  ln -s "${REPO_DIR}/tests/acceptance/fake-configure-shortcuts" "$helper_path"
+  : >"$remove_state"
+  PATH="${remove_bin}:$PATH" XDG_CONFIG_HOME="$fake_config_home" \
+    OMARCHY_MINIMIZE_FAKE_STATE="$remove_state" OMARCHY_MINIMIZE_FAKE_LOG="$remove_log" \
+    bash "$remove_script" >"${work_dir}/readme-remove.out"
+  require_text "$remove_log" 'restore 0xb0b01'
+  require_text "$remove_log" 'restore 0xb0b03'
+  require_text "$remove_log" 'prepareRemoval'
+  if rg -Fq 'restore 0xb0b02' "$remove_log"; then
+    fail 'README removal attempted to restore an externally owned alias'
+  fi
+  local prepare_line restore_line shortcut_line remove_line
+  prepare_line="$(rg -n '^prepareRemoval$' "$remove_log" | cut -d: -f1)"
+  restore_line="$(rg -n '^restore 0xb0b03$' "$remove_log" | cut -d: -f1)"
+  shortcut_line="$(rg -n '^shortcut remove$' "$remove_log" | cut -d: -f1)"
+  remove_line="$(rg -n '^plugin remove osouthgate\.minimize --yes$' "$remove_log" | cut -d: -f1)"
+  [[ "$prepare_line" -lt "$restore_line" && "$restore_line" -lt "$shortcut_line" \
+      && "$shortcut_line" -lt "$remove_line" ]] \
+    || fail 'README removal order is not drain, restore, shortcut removal, then plugin removal'
+  require_text "${work_dir}/readme-remove.out" 'externally owned alias window remains: 0xb0b02'
+
+  rm -f "${remove_state}.drain"
+  : >"$remove_state"
+  : >"${work_dir}/remove-failure.log"
+  if PATH="${remove_bin}:$PATH" XDG_CONFIG_HOME="$fake_config_home" \
+      OMARCHY_MINIMIZE_FAKE_STATE="$remove_state" \
+      OMARCHY_MINIMIZE_FAKE_LOG="${work_dir}/remove-failure.log" \
+      OMARCHY_MINIMIZE_FAKE_RESTORE_FAIL=1 \
+      bash "$remove_script" >"${work_dir}/readme-remove-failure.out" 2>&1; then
+    fail 'README removal continued after a failed owned-window restore'
+  fi
+  if rg -q '^(shortcut remove|plugin remove)' "${work_dir}/remove-failure.log"; then
+    fail 'README removal touched shortcuts or plugin files after restore failure'
+  fi
+  require_text "${work_dir}/remove-failure.log" 'cancelRemoval'
+
+  rm -f "${remove_state}.drain"
+  : >"$remove_state"
+  : >"${work_dir}/remove-timeout.log"
+  if PATH="${remove_bin}:$PATH" XDG_CONFIG_HOME="$fake_config_home" \
+      OMARCHY_MINIMIZE_FAKE_STATE="$remove_state" \
+      OMARCHY_MINIMIZE_FAKE_LOG="${work_dir}/remove-timeout.log" \
+      OMARCHY_MINIMIZE_FAKE_RESTORE_NEVER_VERIFIES=1 \
+      bash "$remove_script" >"${work_dir}/readme-remove-timeout.out" 2>&1; then
+    fail 'README removal continued after a queued restore never verified'
+  fi
+  require_text "${work_dir}/readme-remove-timeout.out" 'Restore did not verify for 0xb0b01'
+  if rg -q '^(shortcut remove|plugin remove)' "${work_dir}/remove-timeout.log"; then
+    fail 'README removal touched shortcuts or plugin files after restore verification timeout'
+  fi
+  require_text "${work_dir}/remove-timeout.log" 'cancelRemoval'
+
+  rm -f "${remove_state}.drain"
+  : >"$remove_state"
+  : >"${work_dir}/remove-unresolved.log"
+  if PATH="${remove_bin}:$PATH" XDG_CONFIG_HOME="$fake_config_home" \
+      OMARCHY_MINIMIZE_FAKE_STATE="$remove_state" \
+      OMARCHY_MINIMIZE_FAKE_LOG="${work_dir}/remove-unresolved.log" \
+      OMARCHY_MINIMIZE_FAKE_UNRESOLVED=1 \
+      bash "$remove_script" >"${work_dir}/readme-remove-unresolved.out" 2>&1; then
+    fail 'README removal continued with an unresolved owned cleanup record'
+  fi
+  require_text "${work_dir}/readme-remove-unresolved.out" 'Owned cleanup is unresolved'
+  require_text "${work_dir}/readme-remove-unresolved.out" 'Unresolved owned window: 0xb0b04'
+  if rg -q '^(restore|shortcut remove|plugin remove)' "${work_dir}/remove-unresolved.log"; then
+    fail 'README removal changed a window, shortcut, or plugin with unresolved ownership'
+  fi
+  require_text "${work_dir}/remove-unresolved.log" 'cancelRemoval'
+
+  : >"$remove_state"
+  printf '%s\n' true >"${remove_state}.drain"
+  : >"${work_dir}/remove-contended.log"
+  if PATH="${remove_bin}:$PATH" XDG_CONFIG_HOME="$fake_config_home" \
+      OMARCHY_MINIMIZE_FAKE_STATE="$remove_state" \
+      OMARCHY_MINIMIZE_FAKE_LOG="${work_dir}/remove-contended.log" \
+      bash "$remove_script" >"${work_dir}/readme-remove-contended.out" 2>&1; then
+    fail 'README removal acquired a drain already owned by another attempt'
+  fi
+  require_text "${work_dir}/remove-contended.log" 'prepareRemoval'
+  if rg -q '^(cancelRemoval|restore|shortcut remove|plugin remove)' \
+      "${work_dir}/remove-contended.log"; then
+    fail 'contended README removal cancelled or mutated another attempt'
+  fi
+  [[ "$(<"${remove_state}.drain")" == true ]] \
+    || fail 'contended README removal cleared the existing drain'
+  printf '%s\n' 'ok - AT-5 ownership-aware restore, verification, and removal order'
+}
+
+at_6() {
+  require_text "${REPO_DIR}/scripts/live-smoke" 'declare -A fixture_process_active=()'
+  require_text "${REPO_DIR}/scripts/live-smoke" 'for process_id in "${!fixture_process_active[@]}"; do'
+  [[ "$(rg -Fc 'unset "fixture_process_active[$process_id]"' \
+      "${REPO_DIR}/scripts/live-smoke")" == 2 ]] \
+    || fail 'live probe does not retire child PIDs from cleanup ownership after wait'
+  if rg -Fq 'fixture_processes' "${REPO_DIR}/scripts/live-smoke"; then
+    fail 'live probe still signals historical fixture PIDs after they are reaped'
+  fi
+  ensure_live
+  require_text "${work_dir}/live.out" 'LIVE_ISOLATION_PASS'
+  require_text "${work_dir}/live.out" 'LIVE_CLEANUP_PASS'
+  require_text "${work_dir}/live.out" 'preexisting_touched=0'
+  require_text "${work_dir}/live.out" 'fixtures_remaining=0'
+  local before after
+  before="$(sed -n 's/^LIVE_CLIENTS_BEFORE addresses=//p' "${work_dir}/live.out")"
+  after="$(sed -n 's/^LIVE_CLIENTS_AFTER addresses=//p' "${work_dir}/live.out")"
+  [[ -n "$before" && "$before" == "$after" ]] \
+    || fail 'live probe before/after pre-existing address sets do not match'
+  printf '%s\n' 'ok - AT-6 disposable live-probe isolation and cleanup'
+}
+
+at_7() {
+  ensure_live
+  for case_name in tiled floating fullscreen title-change close-hidden multiple \
+      current-monitor multi-monitor origin-first origin-fallback; do
+    require_text "${work_dir}/live.out" "LIVE_CASE_PASS ${case_name}"
+  done
+  require_pattern "${work_dir}/live.out" '^LIVE_CASE_PASS title-change .* urgent-like='
+  require_pattern "${work_dir}/live.out" '^LIVE_TX case=close-hidden .* action=restore-move reply=REFUSE:MISSING$'
+  require_text "${work_dir}/live.out" 'pinned=REFUSE:PINNED'
+  require_text "${work_dir}/live.out" 'grouped=REFUSE:GROUPED'
+  require_pattern "${work_dir}/live.out" '^LIVE_ROUTING_PASS origin-first .* code=restore-origin$'
+  require_pattern "${work_dir}/live.out" '^LIVE_ROUTING_PASS fallback .* code=restore-here-fallback reason=Original workspace is unavailable; restoring here instead\.$'
+  require_pattern "${work_dir}/live.out" '^LIVE_ROUTING_PASS restore-here .* chosen=.* monitor=[0-9]+$'
+  require_text "${work_dir}/live.out" 'exact-addresses=pass'
+  printf '%s\n' 'ok - AT-7 exact-address lifecycle and supported/refused state matrix'
+}
+
+at_8() {
+  require_file "${REPO_DIR}/LICENSE"
+  require_text "${REPO_DIR}/README.md" 'OmaVeil'
+  require_text "${REPO_DIR}/LICENSE" 'OmaVeil'
+  require_text "${REPO_DIR}/README.md" '/tmp/minimize-state/windows.json'
+  if find "$REPO_DIR" -type f \
+      ! -path "$REPO_DIR/README.md" ! -path "$REPO_DIR/LICENSE" \
+      ! -path "$REPO_DIR/docs/*" ! -path "$REPO_DIR/tests/*" -print0 \
+      | xargs -0 -r rg -n 'OmaVeil|NiflVeil|minimize-state/windows\.json'; then
+    fail 'runtime product code contains an OmaVeil binary/cache dependency'
+  fi
+  if find "$REPO_DIR" -type l -print -quit | rg -q .; then
+    fail 'package inventory contains symlinked material that could hide a runtime dependency'
+  fi
+  if find "$REPO_DIR" \( -type f -o -type l \) \( -iname '*omaveil*' -o -iname '*niflveil*' \
+      -o -name Cargo.toml -o -name '*.rs' -o -name windows.json \) -print -quit | rg -q .; then
+    fail 'package inventory contains vendored OmaVeil/NiflVeil source, state, or binary material'
+  fi
+  printf '%s\n' 'ok - AT-8 attributed inspiration with no runtime or cache dependency'
+}
+
+at_9() {
+  require_file "$OUTCOME"
+  require_text "$OUTCOME" 'Clicking a row returns a plugin-owned window to its remembered workspace when safe, otherwise it restores here; a secondary action always restores it to the active workspace on the monitor that opened the panel.  → AT-3, AT-7'
+  require_text "$OUTCOME" "Help and shortcut setup live inside the sidebar; opening them is read-only, and only an explicit Save or confirmed Remove changes the plugin's marked, conflict-checked binding block.  → AT-1, AT-2, AT-3"
+  local actual pinned_file prefix resolved canonical digest pin_count
+  actual="$(awk -F'|' '/^\| AT-[0-9]+ / {gsub(/[[:space:]]/, "", $2); print $2}' "$OUTCOME" \
+    | sort -V | paste -sd' ' -)"
+  [[ "$actual" == "$EXPECTED_IDS" ]] \
+    || fail "outcome acceptance IDs are '${actual}', expected '${EXPECTED_IDS}'"
+  for id in $EXPECTED_IDS; do
+    function_name="${id//-/_}"
+    function_name="${function_name,,}"
+    rg -q "^[[:space:]]*${function_name}\(\)" "$0" \
+      || fail "runner has no function for ${id}"
+  done
+  pin_count=0
+  while IFS=$'\t' read -r pinned_file prefix; do
+    [[ -n "$pinned_file" && -n "$prefix" ]] || continue
+    [[ "$pinned_file" != /* ]] || continue
+    case "$pinned_file" in
+      /*|..|../*|*/..|*/../*) fail "outcome hash pin escapes the repository: ${pinned_file}" ;;
+    esac
+    resolved="${REPO_DIR}/${pinned_file}"
+    [[ -f "$resolved" ]] || fail "outcome hash pin target is missing: ${pinned_file}"
+    [[ ! -L "$resolved" ]] || fail "outcome hash pin target is a symlink: ${pinned_file}"
+    canonical="$(realpath -- "$resolved")"
+    [[ "$canonical" == "${REPO_DIR}/"* ]] \
+      || fail "outcome hash pin resolves outside the repository: ${pinned_file}"
+    digest="$(sha256sum "$resolved" | awk '{print $1}')"
+    [[ "${digest:0:${#prefix}}" == "$prefix" ]] \
+      || fail "outcome hash pin is stale for ${pinned_file}: expected ${prefix}, got ${digest:0:${#prefix}}"
+    (( pin_count += 1 ))
+  done < <(awk -F'|' '
+    /^\| `[^`]+` \| `[0-9a-f]+` \|$/ {
+      file=$2; pin=$3
+      gsub(/^[[:space:]]*`|`[[:space:]]*$/, "", file)
+      gsub(/^[[:space:]]*`|`[[:space:]]*$/, "", pin)
+      print file "\t" pin
+    }
+  ' "$OUTCOME")
+  (( pin_count > 0 )) || fail 'outcome contains no verifiable SHA-256 evidence pins'
+  printf '%s\n' 'ok - AT-9 outcome inventory maps completely to the runner'
+}
+
+run_one() {
+  case "$1" in
+    AT-1) at_1 ;;
+    AT-2) at_2 ;;
+    AT-3) at_3 ;;
+    AT-4) at_4 ;;
+    AT-5) at_5 ;;
+    AT-6) at_6 ;;
+    AT-7) at_7 ;;
+    AT-8) at_8 ;;
+    AT-9) at_9 ;;
+    *) fail "unknown acceptance id: $1" ;;
+  esac
+}
+
+if [[ "$REQUESTED" == "AT-ALL" ]]; then
+  output="${work_dir}/acceptance.out"
+  for id in $EXPECTED_IDS; do
+    run_one "$id"
+  done | tee "$output"
+
+  for id in $EXPECTED_IDS; do
+    count="$(rg -c "^ok - ${id}( |$)" "$output" || true)"
+    [[ "$count" == 1 ]] || fail "${id} was reported ${count} times"
+  done
+  reported="$(rg -c '^ok - AT-[0-9]+( |$)' "$output" || true)"
+  [[ "$reported" == 9 ]] || fail "AT-ALL reported ${reported} acceptance IDs, expected 9"
+  printf '%s\n' 'ok - AT-ALL 9/9 documented acceptance IDs reported exactly once'
+else
+  run_one "$REQUESTED"
+fi

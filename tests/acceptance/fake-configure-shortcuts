@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+state=${OMARCHY_MINIMIZE_FAKE_STATE:?fake state path is required}
+log=${OMARCHY_MINIMIZE_FAKE_LOG:?fake log path is required}
+[[ "$*" == remove ]]
+rg -Fxq 0xb0b01 "$state"
+rg -Fxq 0xb0b03 "$state"
+printf '%s\n' 'shortcut remove' >>"$log"

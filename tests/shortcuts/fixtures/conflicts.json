@@ -1,0 +1,14 @@
+[
+  {
+    "modmask": 64,
+    "key": "M",
+    "keycode": 0,
+    "description": "Personal mail"
+  },
+  {
+    "modmask": 72,
+    "key": "m",
+    "keycode": 0,
+    "description": "Personal menu"
+  }
+]

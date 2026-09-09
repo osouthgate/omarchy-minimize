@@ -1,0 +1,8 @@
+{
+  "name": "omarchy-minimize",
+  "private": true,
+  "version": "0.4.1",
+  "scripts": {
+    "test": "node --test --test-isolation=none tests/*.test.cjs"
+  }
+}

@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+clients=${OMARCHY_MINIMIZE_FAKE_CLIENTS:?fake clients fixture is required}
+state=${OMARCHY_MINIMIZE_FAKE_STATE:?fake state path is required}
+log=${OMARCHY_MINIMIZE_FAKE_LOG:?fake log path is required}
+
+case "$*" in
+  '-j activeworkspace')
+    printf '%s\n' '{"id":7,"name":"7","monitor":"FAKE-1"}'
+    ;;
+  '-j clients')
+    completed="$(tr '\n' ' ' <"$state")"
+    jq --arg completed "$completed" \
+      '[.[] | .address as $address | select(($completed | contains($address)) | not)]' "$clients"
+    ;;
+  repl\ *)
+    lua=${2:-}
+    address="$(sed -n 's/^local a,p,s,t="\(0x[0-9a-fA-F]*\)",[0-9][0-9]*,"[0-9a-f]*",[0-9][0-9]*;.*/\1/p' <<<"$lua")"
+    [[ "$address" =~ ^0x[0-9a-fA-F]{1,16}$ ]] || exit 64
+    case "$address" in
+      0xa11ce1) identity='local a,p,s,t="0xa11ce1",4101,"a101",7;' ;;
+      0xa11ce2) identity='local a,p,s,t="0xa11ce2",4102,"a102",7;' ;;
+      0xa11ce3) identity='local a,p,s,t="0xa11ce3",4103,"a103",7;' ;;
+      *) exit 65 ;;
+    esac
+    [[ "$lua" == *"$identity"* ]]
+    [[ "$lua" == *'local g,d,v=hl.get_window,hl.dispatch,hl.dsp.window'* ]]
+    [[ "$lua" == *'return w and w.mapped and w.address==a and w.pid==p and type(w.stable_id)=="number" and string.format("%x",w.stable_id)==s'* ]]
+    [[ "$lua" == *'special:minimum'* && "$lua" == *'special:minimized'* \
+      && "$lua" == *'special:scratchpad'* ]]
+    [[ "$lua" == *'REFUSE:PINNED'* && "$lua" == *'REFUSE:GROUPED'* \
+      && "$lua" == *'REFUSE:MEMBERSHIP'* ]]
+    [[ "$lua" == *'workspace=tostring(t)'* && "$lua" == *'w.workspace.id==t'* ]]
+    [[ "$lua" == *'prop="focus_on_activate",value="unset"'* ]]
+    [[ "$lua" == *'w=g("address:"..a);if not q(w)then return"REFUSE:STALE"end;'*\
+'if w.pinned then return"REFUSE:PINNED"end;if w.group then return"REFUSE:GROUPED"end;'*\
+'if not h(w)then return"REFUSE:MEMBERSHIP"end;'*\
+'d(v.move({workspace=tostring(t),follow=false,window=w}));w=g("address:"..a);'*\
+'if not q(w)then return"ERROR:LOST"end;if not(w.workspace and w.workspace.id==t)then return"ERROR:TARGET"end;'*\
+'local u=d(v.set_prop({prop="focus_on_activate",value="unset",window=w}));'* ]]
+    printf 'repl %s identity=pass membership=pass refusal=pass target=7 unset=pass\n' "$address" >>"$log"
+    printf '%s\n' "$address" >>"$state"
+    printf '%s\n' 'OK:RESTORED'
+    ;;
+  *)
+    printf 'unexpected fake hyprctl call: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac

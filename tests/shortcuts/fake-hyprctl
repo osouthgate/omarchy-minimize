@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -n "${OMARCHY_MINIMIZE_FAKE_LOG:-}" ]]; then
+  printf '%s\n' "$*" >>"$OMARCHY_MINIMIZE_FAKE_LOG"
+fi
+
+case "${1:-}" in
+  binds)
+    printf '%s\n' "${OMARCHY_MINIMIZE_FAKE_BINDS:-[]}"
+    ;;
+  reload)
+    [[ "${OMARCHY_MINIMIZE_FAKE_RELOAD_FAIL:-0}" != 1 ]]
+    ;;
+  configerrors)
+    if [[ -n "${OMARCHY_MINIMIZE_FAKE_CONFIG_ERRORS:-}" ]]; then
+      printf '%s\n' "$OMARCHY_MINIMIZE_FAKE_CONFIG_ERRORS"
+    fi
+    [[ "${OMARCHY_MINIMIZE_FAKE_CONFIGERRORS_FAIL:-0}" != 1 ]]
+    ;;
+  *)
+    printf 'unexpected fake hyprctl call: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+control_fifo=${1:?control FIFO is required}
+initial_title=${2:?initial title is required}
+
+printf '\033]2;%s\007' "$initial_title"
+
+while true; do
+  command=""
+  if IFS= read -r command < "$control_fifo"; then
+    case "$command" in
+      bell)
+        printf '\007'
+        ;;
+      title:*)
+        printf '\033]2;%s\007' "${command#title:}"
+        ;;
+      exit)
+        exit 0
+        ;;
+    esac
+  fi
+done

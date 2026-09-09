@@ -1,0 +1,38 @@
+{
+  "invalidAddresses": [
+    "",
+    "1234",
+    "0x",
+    "0x12 34",
+    "0x1); os.execute('touch /tmp/pwned') --",
+    "0xdeadbeef\nreturn",
+    "address:0x1234",
+    "0x1234\""
+  ],
+  "validAddresses": [
+    "0x1",
+    "0xabcdef",
+    "0xABCDEF"
+  ],
+  "invalidWorkspaces": [
+    "",
+    "0",
+    "-1",
+    "special:dropterm",
+    "special:minimum); os.execute('false')",
+    "name:dev\"; return",
+    "name:dev\nreturn",
+    "name:../../escape",
+    "name:'quoted'",
+    "1; dispatch exit"
+  ],
+  "validWorkspaces": [
+    "1",
+    "42",
+    "name:dev",
+    "name:Project Alpha",
+    "special:minimum",
+    "special:minimized",
+    "special:scratchpad"
+  ]
+}

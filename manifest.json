@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "id": "osouthgate.minimize",
+  "name": "Omarchy Minimize",
+  "version": "0.4.1",
+  "author": "Oliver Southgate",
+  "license": "MIT",
+  "description": "Hide Hyprland windows safely, restore their original workspace, and configure shortcuts from an accessible Omarchy sidebar.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Minimized windows",
+    "description": "Shows and restores windows hidden on compatible special workspaces.",
+    "category": "System",
+    "aliases": [
+      "minimize",
+      "minimized-windows",
+      "window-sidebar"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "panelWidth": 440,
+      "transitionTimeoutMs": 1800
+    },
+    "schema": [
+      {
+        "key": "panelWidth",
+        "type": "integer",
+        "label": "Sidebar width",
+        "min": 320,
+        "max": 720,
+        "step": 20,
+        "defaultValue": 440,
+        "description": "Width in Omarchy spacing units; the panel remains clamped inside its screen."
+      },
+      {
+        "key": "transitionTimeoutMs",
+        "type": "integer",
+        "label": "Transition timeout",
+        "min": 500,
+        "max": 5000,
+        "step": 100,
+        "defaultValue": 1800,
+        "description": "How long to wait for Hyprland to confirm an exact-address move before recovering safely."
+      }
+    ]
+  }
+}

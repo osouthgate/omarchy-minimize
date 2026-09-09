@@ -1,0 +1,704 @@
+#!/usr/bin/env bash
+
+# Disposable integration probe for the exact-address compositor transactions.
+# It never targets a client that it did not create and uniquely class itself.
+
+set -Eeuo pipefail
+export LC_ALL=C
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+plugin_dir=$(cd -- "$script_dir/.." && pwd)
+fixture_program="$plugin_dir/tests/live-smoke/fixture-window"
+transaction_helper="$plugin_dir/tests/live-smoke/transaction-step.cjs"
+live_mode=${OMARCHY_MINIMIZE_LIVE:-auto}
+
+skip_live() {
+  printf 'OMARCHY_MINIMIZE_LIVE_SKIP reason=%s\n' "$1"
+  exit 0
+}
+
+missing=()
+for command_name in hyprctl foot jq node mktemp setsid timeout; do
+  command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
+done
+
+case "$live_mode" in
+  0|false|no|skip)
+    skip_live "disabled-by-OMARCHY_MINIMIZE_LIVE"
+    ;;
+  auto|1|true|yes)
+    ;;
+  *)
+    printf 'OMARCHY_MINIMIZE_LIVE_ERROR invalid-mode=%s\n' "$live_mode" >&2
+    exit 2
+    ;;
+esac
+
+if ((${#missing[@]} > 0)); then
+  if [[ "$live_mode" == auto ]]; then
+    skip_live "missing-tools:${missing[*]}"
+  fi
+  printf 'OMARCHY_MINIMIZE_LIVE_ERROR missing-tools=%s\n' "${missing[*]}" >&2
+  exit 2
+fi
+
+if [[ ! -x "$fixture_program" || ! -f "$transaction_helper" ]]; then
+  printf 'OMARCHY_MINIMIZE_LIVE_ERROR missing-test-helper\n' >&2
+  exit 2
+fi
+
+if ! clients_probe=$(hyprctl -j clients 2>/dev/null) || ! jq -e 'type == "array"' >/dev/null <<<"$clients_probe"; then
+  if [[ "$live_mode" == auto ]]; then
+    skip_live "no-active-hyprland-session"
+  fi
+  printf 'OMARCHY_MINIMIZE_LIVE_ERROR no-active-hyprland-session\n' >&2
+  exit 2
+fi
+
+if [[ $(hyprctl repl 'return"OMARCHY_MINIMIZE_REPL_OK"' 2>/dev/null || true) != "OMARCHY_MINIMIZE_REPL_OK" ]]; then
+  if [[ "$live_mode" == auto ]]; then
+    skip_live "hyprland-repl-unavailable"
+  fi
+  printf 'OMARCHY_MINIMIZE_LIVE_ERROR hyprland-repl-unavailable\n' >&2
+  exit 2
+fi
+
+run_token="$(date +%s)-$$-$RANDOM"
+class_prefix="omarchy-minimize-live-$run_token"
+stage_name="omarchy-minimize-live-$run_token"
+stage_spec="name:$stage_name"
+
+if jq -e --arg prefix "$class_prefix" '.[] | select(.class | startswith($prefix))' >/dev/null <<<"$clients_probe"; then
+  printf 'OMARCHY_MINIMIZE_LIVE_ERROR unique-class-collision=%s\n' "$class_prefix" >&2
+  exit 2
+fi
+
+active_workspace=$(hyprctl -j activeworkspace)
+target_name=$(jq -r '.name // empty' <<<"$active_workspace")
+target_monitor_name=$(jq -r '.monitor // empty' <<<"$active_workspace")
+monitors_snapshot=$(hyprctl -j monitors)
+target_monitor_id=$(jq -r --arg name "$target_monitor_name" '.[] | select(.name == $name) | .id' <<<"$monitors_snapshot" | head -n 1)
+
+workspace_spec_for() {
+  local workspace_name=$1
+  if [[ "$workspace_name" =~ ^[1-9][0-9]{0,9}$ ]] && ((10#$workspace_name <= 2147483647)); then
+    printf '%s' "$workspace_name"
+  elif [[ ${#workspace_name} -le 127 && "$workspace_name" =~ ^[A-Za-z0-9][A-Za-z0-9\ ._:+-]*$ && "$workspace_name" != special:* ]]; then
+    printf 'name:%s' "$workspace_name"
+  else
+    return 1
+  fi
+}
+
+if ! target_spec=$(workspace_spec_for "$target_name"); then
+  if [[ "$live_mode" == auto ]]; then
+    skip_live "focused-workspace-is-not-a-safe-visible-target"
+  fi
+  printf 'OMARCHY_MINIMIZE_LIVE_ERROR unsafe-target-workspace=%s\n' "$target_name" >&2
+  exit 2
+fi
+
+if [[ ! "$target_monitor_id" =~ ^[0-9]+$ ]]; then
+  if [[ "$live_mode" == auto ]]; then
+    skip_live "focused-monitor-could-not-be-resolved"
+  fi
+  printf 'OMARCHY_MINIMIZE_LIVE_ERROR unresolved-focused-monitor\n' >&2
+  exit 2
+fi
+
+secondary_available=0
+secondary_monitor_id=""
+secondary_name=""
+secondary_spec=""
+while IFS=$'\t' read -r monitor_id workspace_name; do
+  [[ "$monitor_id" =~ ^[0-9]+$ && "$monitor_id" != "$target_monitor_id" ]] || continue
+  if candidate_spec=$(workspace_spec_for "$workspace_name"); then
+    secondary_monitor_id=$monitor_id
+    secondary_name=$workspace_name
+    secondary_spec=$candidate_spec
+    secondary_available=1
+    break
+  fi
+done < <(jq -r '.[] | [.id, .activeWorkspace.name] | @tsv' <<<"$monitors_snapshot")
+
+runtime_root=${TMPDIR:-/tmp}
+run_dir=$(mktemp -d "$runtime_root/omarchy-minimize-live.XXXXXX")
+before_json="$run_dir/clients-before.json"
+after_json="$run_dir/clients-after.json"
+printf '%s\n' "$clients_probe" > "$before_json"
+
+baseline_focus=$(hyprctl -j activewindow 2>/dev/null || printf '{}')
+baseline_focus_address=$(jq -r '.address // empty' <<<"$baseline_focus")
+baseline_focus_pid=$(jq -r '.pid // empty' <<<"$baseline_focus")
+baseline_focus_stable=$(jq -r '.stableId // empty' <<<"$baseline_focus")
+
+declare -a fixture_addresses=()
+declare -a touched_addresses=()
+declare -a touched_actions=()
+declare -a touched_identities=()
+declare -A fixture_process_active=()
+declare -A fixture_identity_owned=()
+declare -A fixture_pid=()
+declare -A fixture_stable=()
+declare -A fixture_fifo=()
+declare -A fixture_process=()
+declare -A spawned_pid_for_class=()
+
+trim_reply() {
+  local value=$1
+  value=${value//$'\r'/}
+  value=${value//$'\n'/}
+  printf '%s' "$value"
+}
+
+guard_for_address() {
+  local address=$1
+  local pid=${fixture_pid[$address]:-}
+  local stable=${fixture_stable[$address]:-}
+  [[ "$address" =~ ^0x[0-9a-f]{1,16}$ && "$pid" =~ ^[1-9][0-9]*$ && "$stable" =~ ^[0-9a-f]{1,16}$ ]]
+  printf 'local a,p,s="%s",%s,"%s";local w=hl.get_window("address:"..a);if not(w and w.mapped and w.address==a and w.pid==p and type(w.stable_id)=="number" and string.format("%%x",w.stable_id)==s)then return"REFUSE:STALE"end;' "$address" "$pid" "$stable"
+}
+
+restore_baseline_focus() {
+  [[ "$baseline_focus_address" =~ ^0x[0-9a-f]{1,16}$ ]] || return 0
+  [[ "$baseline_focus_pid" =~ ^[1-9][0-9]*$ ]] || return 0
+  [[ "$baseline_focus_stable" =~ ^[0-9a-f]{1,16}$ ]] || return 0
+  local lua
+  lua="local a,p,s=\"$baseline_focus_address\",$baseline_focus_pid,\"$baseline_focus_stable\";local w=hl.get_window(\"address:\"..a);if not(w and w.mapped and w.address==a and w.pid==p and type(w.stable_id)==\"number\" and string.format(\"%x\",w.stable_id)==s)then return\"SKIP\"end;local r=hl.dispatch(hl.dsp.focus({window=w}));return(r and r.ok)and\"OK\"or\"FAILED\""
+  hyprctl repl "$lua" >/dev/null 2>&1 || true
+}
+
+cleanup() {
+  local status=${1:-$?}
+  trap - EXIT INT TERM HUP
+  set +e
+
+  local address guard lua
+  for address in "${fixture_addresses[@]}"; do
+    guard=$(guard_for_address "$address" 2>/dev/null) || continue
+    lua="${guard}local r=hl.dispatch(hl.dsp.window.close({window=w}));return(r and r.ok)and\"OK\"or\"ERROR:CLOSE\""
+    hyprctl repl "$lua" >/dev/null 2>&1 || true
+  done
+
+  local process_id
+  for process_id in "${!fixture_process_active[@]}"; do
+    [[ "$process_id" =~ ^[1-9][0-9]*$ ]] || continue
+    kill -TERM -- "-$process_id" >/dev/null 2>&1 || kill -TERM "$process_id" >/dev/null 2>&1 || true
+  done
+  for process_id in "${!fixture_process_active[@]}"; do
+    wait "$process_id" 2>/dev/null || true
+    unset "fixture_process_active[$process_id]"
+  done
+
+  # If a foot mapped between spawn and identity capture, the owned process was
+  # already terminated above. Close any lingering uniquely classed surface
+  # with a fresh address+PID+stable-id guard; never fall back to a broad match.
+  local survivor_pid survivor_stable survivor_class survivor_class_literal registered_pid
+  while IFS=$'\t' read -r address survivor_pid survivor_stable survivor_class; do
+    survivor_stable=${survivor_stable,,}
+    [[ "$address" =~ ^0x[0-9a-f]{1,16}$ ]] || continue
+    [[ "$survivor_pid" =~ ^[1-9][0-9]*$ ]] || continue
+    [[ "$survivor_stable" =~ ^[0-9a-f]{1,16}$ ]] || continue
+    [[ "$survivor_class" == "$class_prefix"-* ]] || continue
+    [[ ${#survivor_class} -le 200 && "$survivor_class" =~ ^[A-Za-z0-9_-]+$ ]] || continue
+    registered_pid=${spawned_pid_for_class[$survivor_class]:-}
+    [[ "$registered_pid" =~ ^[1-9][0-9]*$ && "$survivor_pid" == "$registered_pid" ]] || continue
+    survivor_class_literal=$(jq -Rn --arg value "$survivor_class" '$value') || continue
+    lua="local a,p,s,c=\"$address\",$survivor_pid,\"$survivor_stable\",$survivor_class_literal;local w=hl.get_window(\"address:\"..a);if not(w and w.mapped and w.address==a and w.pid==p and type(w.stable_id)==\"number\" and string.format(\"%x\",w.stable_id)==s and w.class==c)then return\"REFUSE:STALE\"end;local r=hl.dispatch(hl.dsp.window.close({window=w}));return(r and r.ok)and\"OK\"or\"ERROR:CLOSE\""
+    hyprctl repl "$lua" >/dev/null 2>&1 || true
+  done < <(hyprctl -j clients 2>/dev/null | jq -r --arg prefix "$class_prefix" '.[] | select(.class | startswith($prefix)) | [.address, (.pid|tostring), .stableId, .class] | @tsv' 2>/dev/null)
+
+  local remaining=-1
+  for _ in $(seq 1 80); do
+    remaining=$(hyprctl -j clients 2>/dev/null | jq --arg prefix "$class_prefix" '[.[] | select(.class | startswith($prefix))] | length' 2>/dev/null)
+    [[ "$remaining" == 0 ]] && break
+    sleep 0.05
+  done
+
+  restore_baseline_focus
+
+  if [[ "$remaining" == 0 ]]; then
+    printf 'LIVE_CLEANUP_PASS fixtures_remaining=0\n'
+  else
+    printf 'OMARCHY_MINIMIZE_LIVE_ERROR cleanup-fixtures-remaining=%s\n' "$remaining" >&2
+    status=1
+  fi
+
+  rm -rf -- "$run_dir"
+  exit "$status"
+}
+trap 'cleanup $?' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
+fail() {
+  printf 'OMARCHY_MINIMIZE_LIVE_ERROR %s\n' "$1" >&2
+  exit 1
+}
+
+mark_touched() {
+  local address=$1
+  local action=$2
+  local identity_key="$address:${fixture_pid[$address]:-}:${fixture_stable[$address]:-}"
+  touched_addresses+=("$address")
+  touched_actions+=("$action")
+  touched_identities+=("$identity_key")
+}
+
+client_json() {
+  local address=$1
+  hyprctl -j clients | jq -c --arg address "$address" '.[] | select(.address == $address)'
+}
+
+client_field() {
+  local address=$1
+  local expression=$2
+  local object
+  object=$(client_json "$address")
+  [[ -n "$object" ]] || return 1
+  jq -r "$expression" <<<"$object"
+}
+
+wait_for_class() {
+  local class_name=$1
+  local expected_pid=${spawned_pid_for_class[$class_name]:-}
+  local matches count
+  [[ "$expected_pid" =~ ^[1-9][0-9]*$ ]] \
+    || fail "fixture-pid-not-registered=$class_name"
+  for _ in $(seq 1 100); do
+    matches=$(hyprctl -j clients | jq -c --arg class "$class_name" \
+      --argjson pid "$expected_pid" \
+      '[.[] | select(.class == $class and .pid == $pid)]')
+    count=$(jq 'length' <<<"$matches")
+    if [[ "$count" == 1 ]]; then
+      SPAWNED_CLIENT=$(jq -c '.[0]' <<<"$matches")
+      return 0
+    fi
+    ((count > 1)) && fail "ambiguous-fixture-identity=$class_name:$expected_pid"
+    sleep 0.05
+  done
+  fail "fixture-did-not-map=$class_name"
+}
+
+wait_for_workspace() {
+  local address=$1
+  local workspace_name=$2
+  local actual=""
+  for _ in $(seq 1 80); do
+    actual=$(client_field "$address" '.workspace.name' 2>/dev/null || true)
+    [[ "$actual" == "$workspace_name" ]] && return 0
+    sleep 0.05
+  done
+  fail "workspace-timeout address=$address expected=$workspace_name actual=$actual"
+}
+
+wait_for_absent() {
+  local address=$1
+  for _ in $(seq 1 80); do
+    [[ -z $(client_json "$address") ]] && return 0
+    sleep 0.05
+  done
+  fail "close-timeout address=$address"
+}
+
+wait_for_value() {
+  local address=$1
+  local expression=$2
+  local expected=$3
+  local actual=""
+  for _ in $(seq 1 80); do
+    actual=$(client_field "$address" "$expression" 2>/dev/null || true)
+    [[ "$actual" == "$expected" ]] && return 0
+    sleep 0.05
+  done
+  fail "state-timeout address=$address expected=$expected actual=$actual"
+}
+
+exact_dispatch() {
+  local address=$1
+  local action=$2
+  local dispatch_expression=$3
+  local guard lua reply
+  guard=$(guard_for_address "$address") || fail "invalid-fixture-identity=$address"
+  lua="${guard}local r=hl.dispatch(${dispatch_expression});return(r and r.ok)and\"OK\"or\"ERROR:DISPATCH\""
+  if ! reply=$(hyprctl repl "$lua" 2>&1); then
+    fail "dispatch-failed action=$action address=$address reply=$(trim_reply "$reply")"
+  fi
+  reply=$(trim_reply "$reply")
+  mark_touched "$address" "$action"
+  [[ "$reply" == OK ]] || fail "dispatch-refused action=$action address=$address reply=$reply"
+}
+
+spawn_fixture() {
+  local label=$1
+  local class_name="$class_prefix-$label"
+  local fifo="$run_dir/$label.control"
+  local title="Omarchy Minimize live $label"
+  mkfifo "$fifo"
+
+  setsid foot --app-id="$class_name" --title="$title" \
+    --override=bell.urgent=yes --override=bell.system=no \
+    "$fixture_program" "$fifo" "$title" >/dev/null 2>&1 &
+  local process_id=$!
+  fixture_process_active["$process_id"]=1
+  spawned_pid_for_class["$class_name"]="$process_id"
+
+  wait_for_class "$class_name"
+  local address pid stable actual_class
+  address=$(jq -r '.address' <<<"$SPAWNED_CLIENT")
+  pid=$(jq -r '.pid' <<<"$SPAWNED_CLIENT")
+  stable=$(jq -r '.stableId' <<<"$SPAWNED_CLIENT" | tr '[:upper:]' '[:lower:]')
+  actual_class=$(jq -r '.class' <<<"$SPAWNED_CLIENT")
+
+  [[ "$address" =~ ^0x[0-9a-f]{1,16}$ ]] || fail "invalid-address-from-compositor=$address"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || fail "invalid-pid-from-compositor=$pid"
+  [[ "$pid" == "$process_id" ]] || fail "fixture-pid-mismatch=$class_name:$pid"
+  [[ "$stable" =~ ^[0-9a-f]{1,16}$ ]] || fail "invalid-stable-id-from-compositor=$stable"
+  [[ "$actual_class" == "$class_name" ]] || fail "fixture-class-mismatch=$actual_class"
+
+  fixture_addresses+=("$address")
+  fixture_pid["$address"]="$pid"
+  fixture_stable["$address"]="$stable"
+  fixture_identity_owned["$address:$pid:$stable"]=1
+  fixture_fifo["$address"]="$fifo"
+  fixture_process["$address"]="$process_id"
+
+  local stage_literal
+  stage_literal=$(jq -Rn --arg value "$stage_spec" '$value')
+  exact_dispatch "$address" "stage-$label" "hl.dsp.window.move({workspace=$stage_literal,follow=false,window=w})"
+  wait_for_workspace "$address" "$stage_name"
+  SPAWNED_ADDRESS="$address"
+}
+
+record_for() {
+  local address=$1
+  local source_workspace=${2:-special:minimum}
+  jq -nc \
+    --arg address "$address" \
+    --argjson pid "${fixture_pid[$address]}" \
+    --arg stable "${fixture_stable[$address]}" \
+    --arg origin "$stage_spec" \
+    --arg source "$source_workspace" \
+    '{address:$address,pid:$pid,compositorStableId:$stable,origin:$origin,sourceWorkspace:$source,owned:true}'
+}
+
+production_step() {
+  local address=$1
+  local label=$2
+  local action=$3
+  local target=$4
+  local expected=$5
+  local source_workspace=${6:-special:minimum}
+  local record lua reply
+  record=$(record_for "$address" "$source_workspace")
+  lua=$(node "$transaction_helper" "$action" "$record" "$target") \
+    || fail "transaction-build-failed action=$action address=$address"
+  if ! reply=$(hyprctl repl "$lua" 2>&1); then
+    fail "transaction-exec-failed action=$action address=$address reply=$(trim_reply "$reply")"
+  fi
+  reply=$(trim_reply "$reply")
+  mark_touched "$address" "$label:$action"
+  printf 'LIVE_TX case=%s address=%s action=%s reply=%s\n' "$label" "$address" "$action" "$reply"
+  [[ "$reply" == "$expected" ]] \
+    || fail "unexpected-reply case=$label action=$action expected=$expected actual=$reply"
+}
+
+minimize_fixture() {
+  local address=$1
+  local label=$2
+  production_step "$address" "$label" minimize special:minimum OK:MINIMIZED
+  wait_for_workspace "$address" special:minimum
+}
+
+restore_fixture() {
+  local address=$1
+  local label=$2
+  local source_workspace=${3:-special:minimum}
+  restore_fixture_to "$address" "$label" "$source_workspace" "$target_spec" "$target_name"
+}
+
+restore_fixture_to() {
+  local address=$1
+  local label=$2
+  local source_workspace=$3
+  local restore_spec=$4
+  local restore_name=$5
+  production_step "$address" "$label" restore-move "$restore_spec" OK:RESTORE_MOVED "$source_workspace"
+  wait_for_workspace "$address" "$restore_name"
+  production_step "$address" "$label" post-restore "$restore_spec" OK:RESTORED "$source_workspace"
+  [[ $(client_field "$address" '.address') == "$address" ]] \
+    || fail "restore-address-mismatch case=$label address=$address"
+}
+
+ensure_floating() {
+  local address=$1
+  local desired=$2
+  local actual
+  actual=$(client_field "$address" '.floating')
+  if [[ "$actual" != "$desired" ]]; then
+    exact_dispatch "$address" "floating-$desired" 'hl.dsp.window.float({action="toggle",window=w})'
+    wait_for_value "$address" '.floating' "$desired"
+  fi
+}
+
+ensure_fullscreen() {
+  local address=$1
+  local actual
+  actual=$(client_field "$address" '.fullscreen')
+  if [[ "$actual" == 0 ]]; then
+    exact_dispatch "$address" fullscreen 'hl.dsp.window.fullscreen({mode="fullscreen",window=w})'
+  fi
+  for _ in $(seq 1 80); do
+    actual=$(client_field "$address" '.fullscreen' 2>/dev/null || printf 0)
+    [[ "$actual" != 0 ]] && return 0
+    sleep 0.05
+  done
+  fail "fullscreen-state-timeout address=$address"
+}
+
+send_control() {
+  local address=$1
+  local command=$2
+  local fifo=${fixture_fifo[$address]}
+  timeout 2 bash -c 'printf "%s\n" "$2" > "$1"' _ "$fifo" "$command" \
+    || fail "fixture-control-timeout address=$address"
+}
+
+retire_fixture() {
+  local address=$1
+  if [[ -n $(client_json "$address") ]]; then
+    exact_dispatch "$address" close 'hl.dsp.window.close({window=w})'
+    wait_for_absent "$address"
+  fi
+  local process_id=${fixture_process[$address]}
+  kill -TERM -- "-$process_id" >/dev/null 2>&1 || kill -TERM "$process_id" >/dev/null 2>&1 || true
+  wait "$process_id" 2>/dev/null || true
+  unset "fixture_process_active[$process_id]"
+}
+
+printf 'OMARCHY_MINIMIZE_LIVE_BEGIN class-prefix=%s target=%s monitor=%s\n' \
+  "$class_prefix" "$target_spec" "$target_monitor_id"
+printf 'LIVE_CLIENTS_BEFORE addresses=%s\n' "$(jq -c '[.[].address] | sort' "$before_json")"
+
+spawn_fixture tiled
+tiled_address=$SPAWNED_ADDRESS
+ensure_floating "$tiled_address" false
+minimize_fixture "$tiled_address" tiled
+restore_fixture "$tiled_address" tiled
+[[ $(client_field "$tiled_address" '.floating') == false ]] || fail "tiled-state-not-preserved"
+retire_fixture "$tiled_address"
+printf 'LIVE_CASE_PASS tiled address=%s\n' "$tiled_address"
+
+spawn_fixture floating
+floating_address=$SPAWNED_ADDRESS
+ensure_floating "$floating_address" true
+minimize_fixture "$floating_address" floating
+restore_fixture "$floating_address" floating
+[[ $(client_field "$floating_address" '.floating') == true ]] || fail "floating-state-not-preserved"
+retire_fixture "$floating_address"
+printf 'LIVE_CASE_PASS floating address=%s\n' "$floating_address"
+
+spawn_fixture fullscreen
+fullscreen_address=$SPAWNED_ADDRESS
+ensure_fullscreen "$fullscreen_address"
+minimize_fixture "$fullscreen_address" fullscreen
+restore_fixture "$fullscreen_address" fullscreen
+[[ $(client_field "$fullscreen_address" '.fullscreen') != 0 ]] || fail "fullscreen-state-not-preserved"
+retire_fixture "$fullscreen_address"
+printf 'LIVE_CASE_PASS fullscreen address=%s\n' "$fullscreen_address"
+
+spawn_fixture title-change
+title_address=$SPAWNED_ADDRESS
+minimize_fixture "$title_address" title-change
+send_control "$title_address" 'title:Build finished - live smoke'
+wait_for_value "$title_address" '.title' 'Build finished - live smoke'
+send_control "$title_address" bell
+urgent_capability=$(client_field "$title_address" 'if has("urgent") then "available" else "unavailable" end')
+if [[ "$urgent_capability" == available ]]; then
+  wait_for_value "$title_address" '.urgent' true
+  urgent_evidence=hyprctl-urgent
+else
+  # foot emitted BEL with bell.urgent=yes while the fixture was hidden. Hyprland
+  # 0.56 accepts the XDG activation signal but omits urgency from clients JSON.
+  urgent_evidence=bell-sent-json-unavailable
+fi
+restore_fixture "$title_address" title-change
+retire_fixture "$title_address"
+printf 'LIVE_CASE_PASS title-change address=%s urgent-like=%s\n' "$title_address" "$urgent_evidence"
+
+spawn_fixture close-hidden
+closed_address=$SPAWNED_ADDRESS
+minimize_fixture "$closed_address" close-hidden
+record_before_close=$(record_for "$closed_address")
+exact_dispatch "$closed_address" close-hidden-close 'hl.dsp.window.close({window=w})'
+wait_for_absent "$closed_address"
+missing_lua=$(node "$transaction_helper" restore-move "$record_before_close" "$target_spec") \
+  || fail "close-hidden-transaction-build-failed"
+missing_reply=$(trim_reply "$(hyprctl repl "$missing_lua" 2>&1)")
+mark_touched "$closed_address" close-hidden:restore-move
+[[ "$missing_reply" == REFUSE:MISSING ]] \
+  || fail "close-hidden-did-not-refuse-missing actual=$missing_reply"
+retire_fixture "$closed_address"
+printf 'LIVE_TX case=close-hidden address=%s action=restore-move reply=%s\n' "$closed_address" "$missing_reply"
+printf 'LIVE_CASE_PASS close-hidden address=%s\n' "$closed_address"
+
+spawn_fixture multiple-a
+multiple_a=$SPAWNED_ADDRESS
+spawn_fixture multiple-b
+multiple_b=$SPAWNED_ADDRESS
+minimize_fixture "$multiple_a" multiple
+minimize_fixture "$multiple_b" multiple
+restore_fixture "$multiple_a" multiple
+restore_fixture "$multiple_b" multiple
+retire_fixture "$multiple_a"
+retire_fixture "$multiple_b"
+printf 'LIVE_CASE_PASS multiple addresses=%s,%s\n' "$multiple_a" "$multiple_b"
+
+spawn_fixture current-monitor
+monitor_address=$SPAWNED_ADDRESS
+minimize_fixture "$monitor_address" current-monitor
+restore_fixture "$monitor_address" current-monitor
+actual_monitor=$(client_field "$monitor_address" '.monitor')
+[[ "$actual_monitor" == "$target_monitor_id" ]] \
+  || fail "current-monitor-mismatch expected=$target_monitor_id actual=$actual_monitor"
+retire_fixture "$monitor_address"
+printf 'LIVE_CASE_PASS current-monitor address=%s monitor=%s\n' "$monitor_address" "$actual_monitor"
+
+# Exercise the production restore planner before executing the production
+# transaction builders. The fixture's remembered named workspace is live, so
+# a different panel fallback must not steal the normal restore target.
+# Keep one owned fixture on the named origin so Hyprland continues reporting
+# that workspace after the tested window moves to the private special.
+spawn_fixture origin-keeper
+origin_keeper_address=$SPAWNED_ADDRESS
+spawn_fixture origin-first
+origin_address=$SPAWNED_ADDRESS
+minimize_fixture "$origin_address" origin-first
+origin_record=$(record_for "$origin_address")
+live_workspaces=$(hyprctl -j workspaces | jq -c '[.[] | {id,name}]')
+origin_plan=$(node "$transaction_helper" plan-restore "$origin_record" "$target_spec" "$live_workspaces") \
+  || fail "origin-first-plan-failed address=$origin_address"
+origin_choice=$(jq -r '.target' <<<"$origin_plan")
+origin_code=$(jq -r '.code' <<<"$origin_plan")
+[[ "$origin_choice" == "$stage_spec" && "$origin_code" == restore-origin ]] \
+  || fail "origin-first-plan-wrong origin=$stage_spec panel=$target_spec plan=$origin_plan"
+restore_fixture_to "$origin_address" origin-first special:minimum "$origin_choice" "$stage_name"
+origin_monitor=$(client_field "$origin_address" '.monitor')
+printf 'LIVE_ROUTING_PASS origin-first address=%s origin=%s panel=%s chosen=%s monitor=%s code=%s\n' \
+  "$origin_address" "$stage_spec" "$target_spec" "$origin_choice" "$origin_monitor" "$origin_code"
+retire_fixture "$origin_address"
+retire_fixture "$origin_keeper_address"
+printf 'LIVE_CASE_PASS origin-first address=%s workspace=%s\n' "$origin_address" "$stage_name"
+
+# A missing remembered origin must yield the named here-fallback reason and
+# use the requesting panel target rather than guessing another workspace.
+spawn_fixture origin-fallback
+fallback_address=$SPAWNED_ADDRESS
+minimize_fixture "$fallback_address" origin-fallback
+missing_origin="name:omarchy-minimize-missing-$run_token"
+fallback_record=$(record_for "$fallback_address" | jq -c --arg origin "$missing_origin" '.origin=$origin')
+fallback_plan=$(node "$transaction_helper" plan-restore "$fallback_record" "$target_spec" "$live_workspaces") \
+  || fail "origin-fallback-plan-failed address=$fallback_address"
+fallback_choice=$(jq -r '.target' <<<"$fallback_plan")
+fallback_code=$(jq -r '.code' <<<"$fallback_plan")
+fallback_reason=$(jq -r '.reason' <<<"$fallback_plan")
+[[ "$fallback_choice" == "$target_spec" && "$fallback_code" == restore-here-fallback \
+    && "$fallback_reason" == 'Original workspace is unavailable; restoring here instead.' ]] \
+  || fail "origin-fallback-plan-wrong origin=$missing_origin panel=$target_spec plan=$fallback_plan"
+restore_fixture_to "$fallback_address" origin-fallback special:minimum "$fallback_choice" "$target_name"
+printf 'LIVE_ROUTING_PASS fallback address=%s origin=%s panel=%s chosen=%s code=%s reason=%s\n' \
+  "$fallback_address" "$missing_origin" "$target_spec" "$fallback_choice" "$fallback_code" "$fallback_reason"
+retire_fixture "$fallback_address"
+printf 'LIVE_CASE_PASS origin-fallback address=%s workspace=%s\n' "$fallback_address" "$target_name"
+
+if ((secondary_available)); then
+  spawn_fixture multi-monitor
+  secondary_address=$SPAWNED_ADDRESS
+  minimize_fixture "$secondary_address" multi-monitor
+  restore_fixture_to "$secondary_address" multi-monitor special:minimum "$secondary_spec" "$secondary_name"
+  actual_secondary_monitor=$(client_field "$secondary_address" '.monitor')
+  [[ "$actual_secondary_monitor" == "$secondary_monitor_id" ]] \
+    || fail "multi-monitor-mismatch expected=$secondary_monitor_id actual=$actual_secondary_monitor"
+  retire_fixture "$secondary_address"
+  printf 'LIVE_CASE_PASS multi-monitor address=%s monitor=%s workspace=%s\n' \
+    "$secondary_address" "$actual_secondary_monitor" "$secondary_name"
+  printf 'LIVE_ROUTING_PASS restore-here address=%s origin=%s panel=%s chosen=%s monitor=%s\n' \
+    "$secondary_address" "$stage_spec" "$secondary_spec" "$secondary_spec" "$actual_secondary_monitor"
+else
+  printf 'LIVE_CASE_SKIP multi-monitor reason=no-second-visible-monitor\n'
+fi
+
+spawn_fixture pinned
+pinned_address=$SPAWNED_ADDRESS
+ensure_floating "$pinned_address" true
+exact_dispatch "$pinned_address" pin 'hl.dsp.window.pin({window=w})'
+wait_for_value "$pinned_address" '.pinned' true
+pinned_workspace_before=$(client_field "$pinned_address" '.workspace.name')
+production_step "$pinned_address" pinned minimize special:minimum REFUSE:PINNED
+pinned_workspace_after=$(client_field "$pinned_address" '.workspace.name')
+[[ "$pinned_workspace_after" == "$pinned_workspace_before" ]] \
+  || fail "pinned-refusal-mutated-workspace"
+exact_dispatch "$pinned_address" unpin 'hl.dsp.window.pin({window=w})'
+retire_fixture "$pinned_address"
+printf 'LIVE_REFUSAL_PASS pinned=REFUSE:PINNED address=%s before-mutation=pass\n' "$pinned_address"
+
+spawn_fixture grouped
+grouped_address=$SPAWNED_ADDRESS
+exact_dispatch "$grouped_address" group 'hl.dsp.group.toggle({window=w})'
+for _ in $(seq 1 80); do
+  grouped_count=$(client_field "$grouped_address" '.grouped | length' 2>/dev/null || printf 0)
+  ((grouped_count > 0)) && break
+  sleep 0.05
+done
+((grouped_count > 0)) || fail "grouped-fixture-could-not-be-constructed"
+grouped_workspace_before=$(client_field "$grouped_address" '.workspace.name')
+production_step "$grouped_address" grouped minimize special:minimum REFUSE:GROUPED
+grouped_workspace_after=$(client_field "$grouped_address" '.workspace.name')
+[[ "$grouped_workspace_after" == "$grouped_workspace_before" ]] \
+  || fail "grouped-refusal-mutated-workspace"
+exact_dispatch "$grouped_address" ungroup 'hl.dsp.group.toggle({window=w})'
+retire_fixture "$grouped_address"
+printf 'LIVE_REFUSAL_PASS grouped=REFUSE:GROUPED address=%s before-mutation=pass\n' "$grouped_address"
+
+rescue_addresses=()
+rescue_aliases=(special:minimum special:minimized special:scratchpad)
+for rescue_alias in "${rescue_aliases[@]}"; do
+  rescue_label="rescue-${rescue_alias#special:}"
+  spawn_fixture "$rescue_label"
+  rescue_address=$SPAWNED_ADDRESS
+  rescue_addresses+=("$rescue_address")
+  production_step "$rescue_address" "$rescue_label" minimize "$rescue_alias" OK:MINIMIZED "$rescue_alias"
+  wait_for_workspace "$rescue_address" "$rescue_alias"
+done
+for rescue_index in "${!rescue_addresses[@]}"; do
+  rescue_address=${rescue_addresses[$rescue_index]}
+  rescue_alias=${rescue_aliases[$rescue_index]}
+  rescue_label="rescue-${rescue_alias#special:}"
+  restore_fixture "$rescue_address" "$rescue_label" "$rescue_alias"
+  retire_fixture "$rescue_address"
+done
+printf 'LIVE_RESCUE_PASS rescue-aliases=minimum,minimized,scratchpad rescue-unset=pass\n'
+
+for identity_key in "${touched_identities[@]}"; do
+  [[ ${fixture_identity_owned[$identity_key]:-0} == 1 ]] || fail "non-fixture-targeted=$identity_key"
+done
+
+remaining_fixture_count=$(hyprctl -j clients | jq --arg prefix "$class_prefix" '[.[] | select(.class | startswith($prefix))] | length')
+[[ "$remaining_fixture_count" == 0 ]] || fail "fixtures-remain-before-final-snapshot=$remaining_fixture_count"
+
+hyprctl -j clients > "$after_json"
+before_set=$(jq -c '[.[].address] | sort' "$before_json")
+after_set=$(jq -c '[.[].address] | sort' "$after_json")
+before_identity_set=$(jq -c '[.[] | [.address, .pid, .stableId, .class]] | sort' "$before_json")
+after_identity_set=$(jq -c '[.[] | [.address, .pid, .stableId, .class]] | sort' "$after_json")
+printf 'LIVE_CLIENTS_AFTER addresses=%s\n' "$after_set"
+[[ "$after_set" == "$before_set" ]] \
+  || fail "preexisting-client-set-changed before=$before_set after=$after_set"
+[[ "$after_identity_set" == "$before_identity_set" ]] \
+  || fail "preexisting-client-identity-set-changed"
+
+printf 'LIVE_ISOLATION_PASS preexisting_touched=0 fixture_addresses=%s transaction_targets=%s\n' \
+  "${#fixture_addresses[@]}" "${#touched_addresses[@]}"
+printf 'exact-addresses=pass\n'
+
+exit 0

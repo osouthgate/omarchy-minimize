@@ -1,0 +1,14 @@
+[
+  {
+    "modmask": 0,
+    "key": "mouse:275",
+    "keycode": 0,
+    "description": "Minimize active window"
+  },
+  {
+    "modmask": 65,
+    "key": "P",
+    "keycode": 0,
+    "description": "Toggle minimized windows"
+  }
+]

@@ -1,0 +1,20 @@
+[
+  {
+    "address": "0xa11ce1",
+    "pid": 4101,
+    "stableId": "a101",
+    "workspace": { "id": -99, "name": "special:minimum" }
+  },
+  {
+    "address": "0xa11ce2",
+    "pid": 4102,
+    "stableId": "a102",
+    "workspace": { "id": -99, "name": "special:minimized" }
+  },
+  {
+    "address": "0xa11ce3",
+    "pid": 4103,
+    "stableId": "a103",
+    "workspace": { "id": -99, "name": "special:scratchpad" }
+  }
+]

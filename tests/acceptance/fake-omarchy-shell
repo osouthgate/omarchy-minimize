@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+state=${OMARCHY_MINIMIZE_FAKE_STATE:?fake state path is required}
+log=${OMARCHY_MINIMIZE_FAKE_LOG:?fake log path is required}
+drain_state="${state}.drain"
+[[ ${1:-} == osouthgate.minimize ]] || exit 64
+
+case ${2:-} in
+  status)
+    printf '%s\n' status >>"$log"
+    draining=false
+    if [[ -r "$drain_state" && "$(<"$drain_state")" == true ]]; then
+      draining=true
+    fi
+    if [[ ${OMARCHY_MINIMIZE_FAKE_UNRESOLVED:-0} == 1 ]]; then
+      printf '{"ok":true,"loaded":true,"stateReady":true,"busy":false,"removalDrain":%s,"unresolvedOwnedCount":1,"unresolvedOwned":[{"address":"0xb0b04","owned":true,"sourceWorkspace":"special:unsupported"}],"entries":[{"address":"0xb0b02","owned":false,"sourceWorkspace":"special:scratchpad"}]}\n' "$draining"
+    elif rg -Fxq 0xb0b01 "$state" && rg -Fxq 0xb0b03 "$state"; then
+      printf '{"ok":true,"loaded":true,"stateReady":true,"busy":false,"removalDrain":%s,"unresolvedOwnedCount":0,"unresolvedOwned":[],"entries":[{"address":"0xb0b02","owned":false,"sourceWorkspace":"special:scratchpad"}]}\n' "$draining"
+    elif rg -Fxq 0xb0b01 "$state"; then
+      printf '{"ok":true,"loaded":true,"stateReady":true,"busy":false,"removalDrain":%s,"unresolvedOwnedCount":0,"unresolvedOwned":[],"entries":[{"address":"0xb0b03","owned":true,"sourceWorkspace":"special:minimized"},{"address":"0xb0b02","owned":false,"sourceWorkspace":"special:scratchpad"}]}\n' "$draining"
+    elif rg -Fxq 0xb0b03 "$state"; then
+      printf '{"ok":true,"loaded":true,"stateReady":true,"busy":false,"removalDrain":%s,"unresolvedOwnedCount":0,"unresolvedOwned":[],"entries":[{"address":"0xb0b01","owned":true,"sourceWorkspace":"special:minimum"},{"address":"0xb0b02","owned":false,"sourceWorkspace":"special:scratchpad"}]}\n' "$draining"
+    else
+      printf '{"ok":true,"loaded":true,"stateReady":true,"busy":false,"removalDrain":%s,"unresolvedOwnedCount":0,"unresolvedOwned":[],"entries":[{"address":"0xb0b01","owned":true,"sourceWorkspace":"special:minimum"},{"address":"0xb0b03","owned":true,"sourceWorkspace":"special:minimized"},{"address":"0xb0b02","owned":false,"sourceWorkspace":"special:scratchpad"}]}\n' "$draining"
+    fi
+    ;;
+  prepareRemoval)
+    printf '%s\n' prepareRemoval >>"$log"
+    if [[ -r "$drain_state" && "$(<"$drain_state")" == true ]]; then
+      printf '%s\n' '{"ok":false,"code":"removal-already-draining","removalDrain":true,"busy":false}'
+      exit 0
+    fi
+    printf '%s\n' true >"$drain_state"
+    printf '%s\n' '{"ok":true,"code":"removal-draining","removalDrain":true,"busy":false}'
+    ;;
+  cancelRemoval)
+    printf '%s\n' cancelRemoval >>"$log"
+    printf '%s\n' false >"$drain_state"
+    printf '%s\n' '{"ok":true,"code":"removal-cancelled"}'
+    ;;
+  restore)
+    [[ ${3:-} == 0xb0b01 || ${3:-} == 0xb0b03 ]] || exit 65
+    printf 'restore %s\n' "$3" >>"$log"
+    if [[ ${OMARCHY_MINIMIZE_FAKE_RESTORE_FAIL:-0} == 1 ]]; then
+      printf '%s\n' '{"ok":false,"code":"synthetic-failure"}'
+    elif [[ ${OMARCHY_MINIMIZE_FAKE_RESTORE_NEVER_VERIFIES:-0} == 1 ]]; then
+      printf '%s\n' '{"ok":true,"code":"queued"}'
+    else
+      printf '%s\n' "$3" >>"$state"
+      printf '%s\n' '{"ok":true,"code":"queued"}'
+    fi
+    ;;
+  *) exit 64 ;;
+esac

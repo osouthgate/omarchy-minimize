@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+state=${OMARCHY_MINIMIZE_FAKE_STATE:?fake state path is required}
+log=${OMARCHY_MINIMIZE_FAKE_LOG:?fake log path is required}
+[[ "$*" == 'plugin remove osouthgate.minimize --yes' ]]
+rg -Fxq 0xb0b01 "$state"
+rg -Fxq 0xb0b03 "$state"
+[[ -r "${state}.drain" && "$(<"${state}.drain")" == true ]]
+printf '%s\n' "$*" >>"$log"
