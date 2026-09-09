@@ -101,7 +101,8 @@ at_2() {
 
 at_3() {
   require_file "${REPO_DIR}/README.md"
-  require_file "${REPO_DIR}/AGENTS.md"
+  [[ ! -e "${REPO_DIR}/AGENTS.md" ]] \
+    || fail 'installable Marketplace payload contains active AGENTS.md instructions'
   require_file "${REPO_DIR}/HelpView.qml"
   require_file "${REPO_DIR}/ShortcutSettingsView.qml"
   for heading in "## Install" "## Daily use" "## Settings" "## Interoperability" \
