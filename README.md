@@ -10,6 +10,12 @@ The live Hyprland client list is the source of truth. Supplemental origin and
 attention metadata is compositor-session scoped below `$XDG_RUNTIME_DIR`; the
 plugin does not treat another minimizer's cache as authoritative.
 
+## Demo
+
+▶ [Watch the 28-second captioned demo](docs/demo.mp4) to see a window minimized,
+the real top-bar indicator update, the sidebar restore it to its original
+workspace, and the built-in Help page.
+
 ## Screenshots
 
 | Minimized-window sidebar | Built-in help |
