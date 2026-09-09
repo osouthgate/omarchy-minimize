@@ -107,7 +107,7 @@ Evidence was refreshed on 2026-09-09 against Omarchy `4.0.2-1`, Hyprland `0.56.2
 |---|---|
 | `manifest.json` | `12995d2ba64c` |
 | `package.json` | `40dfd310a979` |
-| `README.md` | `ab2e9c9e14a4` |
+| `README.md` | `f39654809388` |
 | `MinimizeModel.js` | `ec0848714a3e` |
 | `CompositorTransaction.js` | `84816d49dd4c` |
 | `Service.qml` | `6416277b65e5` |

@@ -12,9 +12,11 @@ plugin does not treat another minimizer's cache as authoritative.
 
 ## Demo
 
-▶ [Watch the 28-second captioned demo](docs/demo.mp4) to see a window minimized,
-the real top-bar indicator update, the sidebar restore it to its original
-workspace, and the built-in Help page.
+[![Captioned Omarchy Minimize demo showing a window minimized and restored through the top-bar sidebar](docs/demo.gif)](docs/demo.mp4)
+
+▶ [Open the full-quality 28-second MP4](docs/demo.mp4). The demo shows a window
+being minimized, the real top-bar indicator updating, the sidebar restoring it
+to its original workspace, and the built-in Help page.
 
 ## Screenshots
 
