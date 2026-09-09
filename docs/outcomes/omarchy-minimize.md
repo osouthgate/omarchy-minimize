@@ -101,7 +101,7 @@ Why — what breaks without it: Removing any one of these constraints permits wr
 
 ### 5.1 Evidence baseline and implementation state
 
-Evidence was refreshed on 2026-09-09 against Omarchy `4.0.2-1`, Hyprland `0.56.2-1` (`efb50993780079460b0cbed1363e2166a2de1d9f`), Quickshell `0.3.1-1`, and the v0.4.1 workspace. The workspace root has no Git metadata, so project references cannot be commit-pinned yet; the following SHA-256 pin makes this review snapshot explicit instead of treating mutable file:line references as timeless:
+Evidence was refreshed on 2026-09-09 against Omarchy `4.0.2-1`, Hyprland `0.56.2-1` (`efb50993780079460b0cbed1363e2166a2de1d9f`), Quickshell `0.3.1-1`, and the v0.4.1 workspace. The initial public release snapshot is commit `308aa06`; the following SHA-256 pin keeps every reviewed runtime and test file independently auditable:
 
 | File | SHA-256 prefix |
 |---|---|
@@ -133,7 +133,7 @@ AT-9 verifies every repository-local row in this table. The dated `/usr/share`
 rows record the inspected Omarchy installation as historical evidence; they are
 not release gates across compatible system upgrades.
 
-The implementation is complete and green while this outcome document is `agreed`: agreement records the human intent confirmed on 2026-09-09, not publication or installation. Tests remain the authority for which behavior is green.
+The implementation is complete, installed, and published while this outcome document remains `agreed`; that status records the human intent confirmed on 2026-09-09, while tests remain the authority for which behavior is green.
 
 Why: Without an explicit package/hash baseline, a later shell API or concurrent working-tree change could be mistaken for the implementation reviewed here.
 
